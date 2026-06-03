@@ -22,7 +22,6 @@ proc newOpenAiProvider*(apiKey, baseUrl: string, retryEnabled: bool = true, maxR
   )
 
 proc isRetryable(statusCode: int, errMsg: string): bool =
-  ## Check if an error is retryable (429, 5xx, network errors)
   if statusCode == 429 or statusCode == 502 or statusCode == 503 or statusCode == 504:
     return true
   let lower = errMsg.toLower
@@ -33,19 +32,14 @@ proc isRetryable(statusCode: int, errMsg: string): bool =
   return false
 
 proc retryDelay(attempt, baseDelayMs: int): int =
-  ## Exponential backoff with cap at 30s
   result = baseDelayMs * (1 shl attempt)
   if result > 30000:
     result = 30000
 
 proc convertMessages(params: ChatParams): JsonNode =
   result = newJArray()
-  
-  # System prompt
   if params.systemPrompt != "":
     result.add(%*{"role": "system", "content": params.systemPrompt})
-  
-  # Conversation messages
   for msg in params.messages:
     var jmsg = newJObject()
     case msg.role
@@ -73,10 +67,8 @@ proc convertTools(tools: seq[ToolDefinition]): JsonNode =
       }
     })
 
-proc doChat(p: OpenAiProvider, params: ChatParams): seq[StreamEvent] =
-  ## Single chat attempt (no retry)
-  result = @[]
-  
+proc doChatStream(p: OpenAiProvider, params: ChatParams, callback: StreamCallback) =
+  ## Single streaming chat attempt — invokes callback for each event as it arrives
   let messages = convertMessages(params)
   let tools = convertTools(params.tools)
   
@@ -89,12 +81,10 @@ proc doChat(p: OpenAiProvider, params: ChatParams): seq[StreamEvent] =
   
   if params.tools.len > 0:
     body["tools"] = tools
-  
   if params.maxTokens > 0:
     body["max_tokens"] = %params.maxTokens
   
   let url = p.baseUrl & "/chat/completions"
-  
   var headers = newHttpHeaders([
     ("Content-Type", "application/json"),
     ("Authorization", "Bearer " & p.apiKey),
@@ -105,9 +95,10 @@ proc doChat(p: OpenAiProvider, params: ChatParams): seq[StreamEvent] =
   
   if response.status != "200 OK":
     let errBody = response.body
-    raise newException(CatchableError, "API error " & response.status & ": " & errBody)
+    callback(StreamEvent(kind: setError, error: "API error " & response.status & ": " & errBody))
+    return
   
-  # Parse SSE stream
+  # Parse SSE stream — emit events as they arrive
   let bodyStream = response.bodyStream
   var toolCalls: seq[tuple[id, name, args: string]] = @[]
   
@@ -127,7 +118,7 @@ proc doChat(p: OpenAiProvider, params: ChatParams): seq[StreamEvent] =
       # Usage
       if chunk.hasKey("usage"):
         let usage = chunk["usage"]
-        result.add(StreamEvent(
+        callback(StreamEvent(
           kind: setUsage,
           inputTokens: usage{"prompt_tokens"}.getInt(0),
           outputTokens: usage{"completion_tokens"}.getInt(0)
@@ -139,11 +130,11 @@ proc doChat(p: OpenAiProvider, params: ChatParams): seq[StreamEvent] =
           if choice.hasKey("delta"):
             let delta = choice["delta"]
             
-            # Text content
+            # Text content — emit immediately
             if delta.hasKey("content") and delta["content"].kind != JNull:
               let text = delta["content"].getStr("")
               if text != "":
-                result.add(StreamEvent(kind: setTextDelta, textDelta: text))
+                callback(StreamEvent(kind: setTextDelta, textDelta: text))
             
             # Tool calls
             if delta.hasKey("tool_calls") and delta["tool_calls"].kind == JArray:
@@ -151,7 +142,6 @@ proc doChat(p: OpenAiProvider, params: ChatParams): seq[StreamEvent] =
                 let idx = tc{"index"}.getInt(0)
                 while toolCalls.len <= idx:
                   toolCalls.add(("", "", ""))
-                
                 if tc.hasKey("id") and tc["id"].kind != JNull:
                   toolCalls[idx].id = tc["id"].getStr("")
                 if tc.hasKey("function"):
@@ -165,14 +155,13 @@ proc doChat(p: OpenAiProvider, params: ChatParams): seq[StreamEvent] =
           if choice.hasKey("finish_reason") and choice["finish_reason"].kind != JNull:
             let reason = choice["finish_reason"].getStr("")
             if reason == "tool_calls":
-              # Emit tool calls
               for tc in toolCalls:
                 var args: JsonNode
                 try:
                   args = parseJson(tc.args)
                 except:
                   args = newJObject()
-                result.add(StreamEvent(
+                callback(StreamEvent(
                   kind: setToolCall,
                   toolCallId: tc.id,
                   toolName: tc.name,
@@ -183,26 +172,29 @@ proc doChat(p: OpenAiProvider, params: ChatParams): seq[StreamEvent] =
     except JsonParsingError:
       continue
   
-  result.add(StreamEvent(kind: setDone, stopReason: "stop"))
+  callback(StreamEvent(kind: setDone, stopReason: "stop"))
 
-method chat*(p: OpenAiProvider, params: ChatParams): seq[StreamEvent] =
-  ## Chat with automatic retry on transient errors
+method chatStream*(p: OpenAiProvider, params: ChatParams, callback: StreamCallback) =
+  ## Streaming chat with automatic retry on transient errors
+  proc doAttempt() =
+    p.doChatStream(params, callback)
+  
   if not p.retryEnabled:
     try:
-      return p.doChat(params)
+      doAttempt()
     except CatchableError as e:
-      return @[StreamEvent(kind: setError, error: e.msg)]
+      callback(StreamEvent(kind: setError, error: e.msg))
+    return
   
   var lastError = ""
   for attempt in 0 .. p.maxRetries:
     try:
-      return p.doChat(params)
+      doAttempt()
+      return
     except CatchableError as e:
       lastError = e.msg
-      # Check if retryable
       var statusCode = 0
       try:
-        # Extract status code from error message like "API error 429 Too Many Requests: ..."
         let parts = lastError.split(" ")
         if parts.len >= 3 and parts[0] == "API" and parts[1] == "error":
           statusCode = parseInt(parts[2])
@@ -210,13 +202,20 @@ method chat*(p: OpenAiProvider, params: ChatParams): seq[StreamEvent] =
         discard
       
       if not isRetryable(statusCode, lastError):
-        return @[StreamEvent(kind: setError, error: lastError)]
+        callback(StreamEvent(kind: setError, error: lastError))
+        return
       
       if attempt < p.maxRetries:
         let delay = retryDelay(attempt, p.baseDelayMs)
-        # Emit retry event for UI
-        result.add(StreamEvent(kind: setError, error: "Retrying (" & $(attempt+1) & "/" & $p.maxRetries & "): " & lastError & " — waiting " & $(delay div 1000) & "s..."))
+        callback(StreamEvent(kind: setError, error: "Retrying (" & $(attempt+1) & "/" & $p.maxRetries & "): " & lastError & " — waiting " & $(delay div 1000) & "s..."))
         sleep(delay)
-        result = @[]  # Clear retry message
   
-  return @[StreamEvent(kind: setError, error: lastError)]
+  callback(StreamEvent(kind: setError, error: lastError))
+
+method chat*(p: OpenAiProvider, params: ChatParams): seq[StreamEvent] =
+  ## Non-streaming fallback: collects all events into a seq
+  var events: seq[StreamEvent] = @[]
+  proc collect(event: StreamEvent) =
+    events.add(event)
+  p.chatStream(params, collect)
+  return events

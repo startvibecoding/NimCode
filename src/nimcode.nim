@@ -52,11 +52,30 @@ proc resolveProviderConfig*(settings: Settings, name: string): ProviderConfig =
   let opt = settings.getProviderConfig(name)
   if opt.isSome:
     return opt.get()
-  # Fallback to default
   let defaultOpt = settings.getProviderConfig(settings.defaultProvider)
   if defaultOpt.isSome:
     return defaultOpt.get()
   raise newException(CatchableError, "Provider not found: " & name)
+
+## Stream callback for CLI — writes each token immediately with flush
+proc cliStreamCallback(event: AgentEvent) =
+  case event.kind
+  of aekTextDelta:
+    stdout.write(event.textDelta)
+    stdout.flushFile()
+  of aekToolCall:
+    stdout.write("\n")
+    stdout.write(formatToolCall(event.toolName, "{}"))
+    stdout.flushFile()
+  of aekToolResult:
+    stdout.write(formatToolResult(event.resultToolName, event.resultText, event.resultIsError))
+    stdout.flushFile()
+  of aekError:
+    stderr.writeLine(formatError(event.errorMsg))
+    stderr.flushFile()
+  of aekDone:
+    stdout.write("\n")
+    stdout.flushFile()
 
 proc run(args: seq[string], opts: var OptParser) =
   var providerName = ""
@@ -158,22 +177,17 @@ proc run(args: seq[string], opts: var OptParser) =
     quit(1)
   
   # Create provider based on API type
-  # Supports: openai-chat, openai-responses (OpenAI-compatible),
-  #           anthropic-messages, google-gemini
-  # Any other api type defaults to OpenAI-compatible
   var provider: Provider
   if providerConfig.api == "anthropic-messages":
     provider = newAnthropicProvider(apiKey, providerConfig.baseUrl)
   elif providerConfig.api == "google-gemini":
     provider = newGoogleGeminiProvider(apiKey, providerConfig.baseUrl)
   else:
-    # openai-chat, openai-responses, or any other OpenAI-compatible API
     provider = newOpenAiProvider(apiKey, providerConfig.baseUrl)
   
-  # Get working directory
   let cwd = getCurrentDir()
   
-  # Load context files (before provider creation so user always sees what's loaded)
+  # Load context files
   let globalConfigDir = configDir()
   let cfResult = loadContextFiles(cwd, globalConfigDir)
   let contextStr = buildContextString(cfResult)
@@ -191,7 +205,6 @@ proc run(args: seq[string], opts: var OptParser) =
   let mem = newMemory(memoryPath)
   let memoryContext = mem.getContext()
   
-  # Combine extra context
   let extraContext = contextStr & skillsContext & memoryContext
   
   # Setup session
@@ -209,31 +222,20 @@ proc run(args: seq[string], opts: var OptParser) =
   else:
     sess = newSession(cwd)
   
-  # Create agent with extra context
+  # Create agent
   let agent = newAgent(
     provider, modelName, mode, cwd, sess,
     extraContext = extraContext,
     settings = settings
   )
   
+  # Print mode: stream directly to stdout
   if printMode:
-    # Non-interactive mode
     let userMsg = messages.join(" ")
     if userMsg == "":
       echo "Error: Message required in print mode"
       quit(1)
-    
-    let events = agent.processAgentTurn(userMsg)
-    for event in events:
-      case event.kind
-      of aekTextDelta:
-        stdout.write(event.textDelta)
-      of aekError:
-        stderr.writeLine("Error: " & event.errorMsg)
-      of aekDone:
-        stdout.writeLine("")
-      else:
-        discard
+    agent.processAgentTurnStream(userMsg, cliStreamCallback)
     return
   
   # Interactive mode
@@ -246,31 +248,15 @@ proc run(args: seq[string], opts: var OptParser) =
   echo "Working directory: " & cwd
   echo ""
   
-  # Show loaded context files
   if contextFilesInfo != "":
     echo formatContextFiles(contextFilesInfo)
-  
-  # Show session info
   if sessionInfo != "":
     echo formatSession(sessionInfo)
   
+  # Process initial message with streaming
   if messages.len > 0:
-    # Process initial message
     let userMsg = messages.join(" ")
-    let events = agent.processAgentTurn(userMsg)
-    for event in events:
-      case event.kind
-      of aekTextDelta:
-        stdout.write(event.textDelta)
-      of aekToolCall:
-        let argsStr = "{}"
-        echo "\n" & formatToolCall(event.toolName, argsStr)
-      of aekToolResult:
-        echo formatToolResult(event.resultToolName, event.resultText, event.resultIsError)
-      of aekError:
-        stderr.writeLine(formatError(event.errorMsg))
-      of aekDone:
-        stdout.writeLine("")
+    agent.processAgentTurnStream(userMsg, cliStreamCallback)
   
   # Interactive loop
   while true:
@@ -281,7 +267,6 @@ proc run(args: seq[string], opts: var OptParser) =
     if input.strip() == "":
       continue
     
-    # Handle commands
     let cmd = input.strip
     if cmd == "exit" or cmd == "quit":
       break
@@ -348,21 +333,8 @@ proc run(args: seq[string], opts: var OptParser) =
       echo "Type 'help' for available commands"
       continue
     
-    # Process as agent turn
-    let events = agent.processAgentTurn(input)
-    for event in events:
-      case event.kind
-      of aekTextDelta:
-        stdout.write(event.textDelta)
-      of aekToolCall:
-        let argsStr = "{}"
-        echo "\n" & formatToolCall(event.toolName, argsStr)
-      of aekToolResult:
-        echo formatToolResult(event.resultToolName, event.resultText, event.resultIsError)
-      of aekError:
-        stderr.writeLine(formatError(event.errorMsg))
-      of aekDone:
-        stdout.writeLine("")
+    # Process with real-time streaming
+    agent.processAgentTurnStream(input, cliStreamCallback)
 
 when isMainModule:
   try:

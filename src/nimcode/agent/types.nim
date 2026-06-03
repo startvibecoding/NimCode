@@ -25,3 +25,6 @@ type
       doneStopReason*: string
     of aekError:
       errorMsg*: string
+
+  AgentEventCallback* = proc(event: AgentEvent) {.closure.}
+    ## Callback for real-time streaming of agent events

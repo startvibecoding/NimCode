@@ -57,6 +57,9 @@ type
     of setError:
       error*: string
 
+  StreamCallback* = proc(event: StreamEvent) {.closure.}
+    ## Callback invoked for each streaming event as it arrives.
+
   ChatParams* = object
     messages*: seq[Message]
     tools*: seq[ToolDefinition]
@@ -69,6 +72,13 @@ type
 
 method chat*(p: Provider, params: ChatParams): seq[StreamEvent] {.base.} =
   raise newException(CatchableError, "Not implemented")
+
+method chatStream*(p: Provider, params: ChatParams, callback: StreamCallback) {.base.} =
+  ## Streaming chat: invokes callback for each event as it arrives.
+  ## Default implementation falls back to non-streaming chat.
+  let events = p.chat(params)
+  for event in events:
+    callback(event)
 
 proc newUserMessage*(text: string): Message =
   Message(role: mrUser, content: text)
