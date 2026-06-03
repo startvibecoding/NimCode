@@ -6,15 +6,24 @@ type
     path*: string
     modTime*: DateTime
     name*: string
+    id*: string
+    messageCount*: int
+    preview*: string
 
   Session* = ref object
     file*: string
     messages*: seq[Message]
     cwd*: string
+    id*: string
 
 proc encodePath*(p: string): string =
   ## Encode a directory path for use in a session directory name
   return encode(p)
+
+proc generateId*(): string =
+  ## Generate a random 8-char hex session ID
+  let now = now()
+  result = now.format("HHmmss") & $now.second
 
 proc sessionDir*(): string =
   let home = getHomeDir()
@@ -23,29 +32,46 @@ proc sessionDir*(): string =
 proc getSessionDir*(cwd: string): string =
   return sessionDir()
 
-proc newSession*(cwd: string): Session =
+proc sessionFileId*(path: string): string =
+  ## Extract session ID from filename: session_TIMESTAMP_ID.jsonl
+  let base = path.extractFilename
+  let noExt = base.changeFileExt("")
+  let idx = noExt.find("_session_")
+  if idx >= 0:
+    return noExt[idx + 9 .. ^1]
+  return ""
+
+proc listSessionsForDir*(cwd: string): seq[SessionInfo] =
+  ## Lists session files for a given working directory
+  result = @[]
   let dir = sessionDir()
-  createDir(dir)
-  let timestamp = now().format("yyyyMMddHHmmss")
-  let file = dir / "session_" & timestamp & ".jsonl"
-  result = Session(file: file, messages: @[], cwd: cwd)
   
-  # Write header
-  try:
-    let header = %*{
-      "type": "session",
-      "version": 1,
-      "timestamp": $now(),
-      "cwd": cwd
-    }
-    let f = open(file, fmWrite)
-    f.writeLine($header)
-    f.close()
-  except:
-    discard
+  if not dirExists(dir):
+    return
+  
+  for kind, entry in walkDir(dir):
+    if kind != pcFile:
+      continue
+    if not entry.endsWith(".jsonl"):
+      continue
+    
+    try:
+      let info = getFileInfo(entry)
+      let sessId = sessionFileId(entry)
+      result.add(SessionInfo(
+        path: entry,
+        modTime: info.lastWriteTime.local,
+        name: entry.extractFilename,
+        id: sessId
+      ))
+    except:
+      continue
+  
+  # Sort by modification time (newest first)
+  result.sort(proc (a, b: SessionInfo): int = cmp(b.modTime, a.modTime))
 
 proc loadSession*(file: string): Session =
-  result = Session(file: file, messages: @[], cwd: getCurrentDir())
+  result = Session(file: file, messages: @[], cwd: getCurrentDir(), id: sessionFileId(file))
   if not fileExists(file):
     return
   
@@ -62,6 +88,8 @@ proc loadSession*(file: string): Session =
         try:
           let j = parseJson(line)
           if j.hasKey("type") and j["type"].getStr() == "session":
+            if j.hasKey("cwd"):
+              result.cwd = j["cwd"].getStr()
             continue
         except:
           discard
@@ -87,32 +115,28 @@ proc loadSession*(file: string): Session =
   except:
     discard
 
-proc listSessionsForDir*(cwd: string): seq[SessionInfo] =
-  ## Lists session files for a given working directory
-  result = @[]
+proc newSession*(cwd: string): Session =
   let dir = sessionDir()
+  createDir(dir)
+  let timestamp = now().format("yyyyMMddHHmmss")
+  let id = generateId()
+  let file = dir / "session_" & timestamp & "_" & id & ".jsonl"
+  result = Session(file: file, messages: @[], cwd: cwd, id: id)
   
-  if not dirExists(dir):
-    return
-  
-  for kind, entry in walkDir(dir):
-    if kind != pcFile:
-      continue
-    if not entry.endsWith(".jsonl"):
-      continue
-    
-    try:
-      let info = getFileInfo(entry)
-      result.add(SessionInfo(
-        path: entry,
-        modTime: info.lastWriteTime.local,
-        name: entry.extractFilename
-      ))
-    except:
-      continue
-  
-  # Sort by modification time (newest first)
-  result.sort(proc (a, b: SessionInfo): int = cmp(b.modTime, a.modTime))
+  # Write header
+  try:
+    let header = %*{
+      "type": "session",
+      "version": 1,
+      "id": id,
+      "timestamp": $now(),
+      "cwd": cwd
+    }
+    let f = open(file, fmWrite)
+    f.writeLine($header)
+    f.close()
+  except:
+    discard
 
 proc continueRecent*(cwd: string): Session =
   ## Continues the most recent session for a directory, or creates new
@@ -131,13 +155,29 @@ proc openByPathOrID*(cwd, value: string): Session =
   if value.endsWith(".jsonl") or value.contains($DirSep):
     return loadSession(value)
   
-  # Try to find by ID in filename
+  # Try to find by ID prefix in filename
   let sessions = listSessionsForDir(cwd)
-  for s in sessions:
-    if s.name.contains(value):
-      return loadSession(s.path)
+  var matchIdx = -1
+  for i, s in sessions:
+    if s.id == value or s.id.startsWith(value):
+      if matchIdx >= 0:
+        raise newException(CatchableError, "session ID " & value & " is ambiguous")
+      matchIdx = i
+  
+  if matchIdx >= 0:
+    return loadSession(sessions[matchIdx].path)
   
   raise newException(CatchableError, "session not found: " & value)
+
+proc deleteSession*(path: string): bool =
+  ## Deletes a session file
+  try:
+    if fileExists(path):
+      removeFile(path)
+      return true
+  except:
+    discard
+  return false
 
 proc appendMessage*(session: Session, msg: Message) =
   session.messages.add(msg)
@@ -168,8 +208,13 @@ proc getMessages*(session: Session): seq[Message] =
 proc getFile*(session: Session): string =
   return session.file
 
+proc getId*(session: Session): string =
+  return session.id
+
 proc getSessionInfo*(session: Session): string =
   ## Returns a human-readable session info string
   let fileName = session.file.extractFilename
   let msgCount = session.messages.len
-  return "📂 Session: " & fileName & " (" & $msgCount & " messages)"
+  result = "Session: " & fileName & " (" & $msgCount & " messages)"
+  if session.id != "":
+    result.add(" [" & session.id & "]")

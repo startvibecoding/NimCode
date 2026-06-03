@@ -299,6 +299,8 @@ proc run(args: seq[string], opts: var OptParser) =
       echo "  model    - Show current model"
       echo "  thinking - Show thinking level"
       echo "  session  - Show session info"
+      echo "  sessions - List recent sessions"
+      echo "  usage    - Show context usage"
       continue
     elif cmd == "mode":
       echo "Mode: " & mode
@@ -314,6 +316,24 @@ proc run(args: seq[string], opts: var OptParser) =
       continue
     elif cmd == "session":
       echo sess.getSessionInfo()
+      continue
+    elif cmd == "sessions":
+      let sessions = listSessionsForDir(cwd)
+      if sessions.len == 0:
+        echo "No sessions found"
+      else:
+        echo "Recent sessions:"
+        for s in sessions:
+          if sessions.find(s) >= 10: break
+          echo "  " & s.id & "  " & s.name
+      continue
+    elif cmd == "usage":
+      let usage = agent.getContextUsage()
+      echo "Context: " & $usage.tokens & " tokens"
+      if usage.contextWindow > 0:
+        echo "Window: " & $usage.contextWindow & " tokens"
+      if usage.percent.isSome:
+        echo "Usage: " & formatFloat(usage.percent.get, ffDecimal, 1) & "%"
       continue
     elif cmd.startsWith("mode "):
       let newMode = cmd[5 .. ^1].strip
