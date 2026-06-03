@@ -1,4 +1,4 @@
-import std/[json, os, osproc, strutils, options, algorithm]
+import std/[json, os, osproc, strutils, options, algorithm, sequtils, times, streams, base64]
 import ../provider/types
 import ./jobs as jobsModule
 
@@ -13,10 +13,16 @@ type
     steps*: seq[PlanStep]
     note*: string
 
+  FileDiff* = object
+    path*: string
+    added*: int
+    deleted*: int
+
   ToolResult* = object
     text*: string
     isError*: bool
     plan*: Option[TaskPlan]  ## Optional structured task plan
+    diff*: Option[FileDiff]  ## Optional file diff info
 
   Tool* = ref object of RootObj
     name*: string
@@ -24,8 +30,23 @@ type
     parameters*: JsonNode
     workDir*: string
 
-proc newToolResult*(text: string, isError: bool = false, plan: Option[TaskPlan] = none(TaskPlan)): ToolResult =
-  ToolResult(text: text, isError: isError, plan: plan)
+proc newToolResult*(text: string, isError: bool = false, plan: Option[TaskPlan] = none(TaskPlan), diff: Option[FileDiff] = none(FileDiff)): ToolResult =
+  ToolResult(text: text, isError: isError, plan: plan, diff: diff)
+
+# Diff helpers
+proc buildDiffSummary(oldContent, newContent: string): string =
+  ## Build a compact diff summary showing added/removed line counts
+  let oldLines = if oldContent == "": @[] else: oldContent.splitLines()
+  let newLines = if newContent == "": @[] else: newContent.splitLines()
+  let deleted = oldLines.len
+  let added = newLines.len
+  result = "Diff: +" & $added & " -" & $deleted
+
+proc formatDiffResult(path, oldContent, newContent: string): string =
+  result = "Applied edit to " & path & "\n" & buildDiffSummary(oldContent, newContent)
+
+proc formatWriteDiffResult(path: string, oldContent, newContent: string, bytes: int): string =
+  result = "File written: " & path & " (" & $bytes & " bytes)\n" & buildDiffSummary(oldContent, newContent)
 
 # Path resolution and security
 proc resolvePath*(workDir: string, path: string): tuple[path: string, ok: bool] =
@@ -119,7 +140,16 @@ proc executePlan(tool: Tool, params: JsonNode): ToolResult =
   
   return newToolResult(formatTaskPlan(plan), false, some(plan))
 
-# Read Tool
+# Read Tool (with image support)
+const imageExtensions* = [".jpg", ".jpeg", ".png", ".gif", ".webp"]
+
+proc isImageFile(path: string): bool =
+  let lower = path.toLower
+  for ext in imageExtensions:
+    if lower.endsWith(ext):
+      return true
+  return false
+
 proc readToolParams(): JsonNode =
   %*{
     "type": "object",
@@ -142,6 +172,23 @@ proc executeRead(tool: Tool, params: JsonNode): ToolResult =
   
   if not fileExists(fullPath):
     return newToolResult("File not found: " & fullPath, true)
+  
+  # Image file: return base64 encoded content
+  if fullPath.isImageFile:
+    try:
+      let content = readFile(fullPath)
+      let encoded = content.encode()
+      let ext = fullPath.splitFile.ext.toLower
+      var mimeType = "image/png"
+      case ext
+      of ".jpg", ".jpeg": mimeType = "image/jpeg"
+      of ".png": mimeType = "image/png"
+      of ".gif": mimeType = "image/gif"
+      of ".webp": mimeType = "image/webp"
+      else: discard
+      return newToolResult("[image] " & fullPath & " (" & mimeType & ", " & $content.len & " bytes)\n" & encoded)
+    except CatchableError as e:
+      return newToolResult("Error reading image: " & e.msg, true)
   
   try:
     let content = readFile(fullPath)
@@ -167,13 +214,13 @@ proc executeRead(tool: Tool, params: JsonNode): ToolResult =
   except CatchableError as e:
     return newToolResult("Error reading file: " & e.msg, true)
 
-# Write Tool
+# Write Tool (with diff)
 proc writeToolParams(): JsonNode =
   %*{
     "type": "object",
     "properties": {
       "path": {"type": "string", "description": "Path to the file to write"},
-      "content": {"type": "string", "description": "Content to write"}
+      "content": {"type": "string", "description": "Content to write to the file"}
     },
     "required": ["path", "content"]
   }
@@ -192,33 +239,48 @@ proc executeWrite(tool: Tool, params: JsonNode): ToolResult =
     return newToolResult("Invalid path: " & path, true)
   
   try:
+    var oldContent = ""
+    if fileExists(fullPath):
+      oldContent = readFile(fullPath)
     createDir(fullPath.parentDir)
     writeFile(fullPath, content)
-    return newToolResult("File written: " & fullPath & " (" & $content.len & " bytes)")
+    let diff = FileDiff(path: fullPath, added: content.splitLines.len, deleted: oldContent.splitLines.len)
+    return newToolResult(formatWriteDiffResult(fullPath, oldContent, content, content.len), false, none(TaskPlan), some(diff))
   except CatchableError as e:
     return newToolResult("Error writing file: " & e.msg, true)
 
-# Edit Tool
+# Edit Tool (support both old format and new edits[] format)
 proc editToolParams(): JsonNode =
   %*{
     "type": "object",
     "properties": {
-      "path": {"type": "string", "description": "Path to the file to edit"},
-      "oldText": {"type": "string", "description": "Exact text to find"},
-      "newText": {"type": "string", "description": "Replacement text"}
+      "path": {
+        "type": "string",
+        "description": "Path to the file to edit"
+      },
+      "edits": {
+        "type": "array",
+        "description": "Array of edits. Each edit has oldText (exact match) and newText (replacement).",
+        "items": {
+          "type": "object",
+          "properties": {
+            "oldText": {"type": "string", "description": "Exact text to find and replace"},
+            "newText": {"type": "string", "description": "Replacement text"}
+          },
+          "required": ["oldText", "newText"]
+        }
+      },
+      "oldText": {"type": "string", "description": "Exact text to find (legacy single-edit mode)"},
+      "newText": {"type": "string", "description": "Replacement text (legacy single-edit mode)"}
     },
-    "required": ["path", "oldText", "newText"]
+    "required": ["path"]
   }
 
 proc executeEdit(tool: Tool, params: JsonNode): ToolResult =
   let path = params{"path"}.getStr("")
-  let oldText = params{"oldText"}.getStr("")
-  let newText = params{"newText"}.getStr("")
   
   if path == "":
     return newToolResult("path is required", true)
-  if oldText == "":
-    return newToolResult("oldText is required", true)
   
   let (fullPath, ok) = resolvePath(tool.workDir, path)
   if not ok:
@@ -227,28 +289,61 @@ proc executeEdit(tool: Tool, params: JsonNode): ToolResult =
   if not fileExists(fullPath):
     return newToolResult("File not found: " & fullPath, true)
   
+  # Collect edits from either format
+  type EditEntry = object
+    oldText: string
+    newText: string
+  
+  var edits: seq[EditEntry] = @[]
+  
+  # New format: edits[] array
+  let editsRaw = params{"edits"}
+  if editsRaw.kind == JArray and editsRaw.len > 0:
+    for i in 0 ..< editsRaw.len:
+      let e = editsRaw[i]
+      let ot = e{"oldText"}.getStr("")
+      let nt = e{"newText"}.getStr("")
+      if ot == "":
+        return newToolResult("edit " & $i & ": oldText is required", true)
+      edits.add(EditEntry(oldText: ot, newText: nt))
+  else:
+    # Legacy format: oldText/newText
+    let oldText = params{"oldText"}.getStr("")
+    let newText = params{"newText"}.getStr("")
+    if oldText == "":
+      return newToolResult("oldText or edits[] is required", true)
+    edits.add(EditEntry(oldText: oldText, newText: newText))
+  
   try:
     var content = readFile(fullPath)
-    let count = content.count(oldText)
+    let originalContent = content
     
-    if count == 0:
-      return newToolResult("oldText not found in file", true)
-    if count > 1:
-      return newToolResult("oldText matches " & $count & " times (must be unique)", true)
+    # Validate all edits before applying
+    for i, e in edits:
+      let count = content.count(e.oldText)
+      if count == 0:
+        return newToolResult("edit " & $i & ": oldText not found in file", true)
+      if count > 1:
+        return newToolResult("edit " & $i & ": oldText matches " & $count & " times (must be unique)", true)
     
-    content = content.replace(oldText, newText)
+    # Apply all edits
+    for i, e in edits:
+      content = content.replace(e.oldText, e.newText)
+    
     writeFile(fullPath, content)
-    return newToolResult("Applied edit to " & fullPath)
+    let diff = FileDiff(path: fullPath, added: edits.len, deleted: edits.len)
+    return newToolResult("Applied " & $edits.len & " edit(s) to " & fullPath & "\n" & buildDiffSummary(originalContent, content), false, none(TaskPlan), some(diff))
   except CatchableError as e:
     return newToolResult("Error editing file: " & e.msg, true)
 
-# Bash Tool
+# Bash Tool (with timeout and async support)
 proc bashToolParams(): JsonNode =
   %*{
     "type": "object",
     "properties": {
       "command": {"type": "string", "description": "Shell command to execute"},
-      "timeout": {"type": "integer", "description": "Timeout in seconds (default 120)"}
+      "timeout": {"type": "integer", "description": "Timeout in seconds (default 120, max 600)"},
+      "async": {"type": "boolean", "description": "Run command in background (for long-running services like servers). Returns immediately with a job ID. Use 'jobs' tool to check status."}
     },
     "required": ["command"]
   }
@@ -258,7 +353,17 @@ proc executeBash(tool: Tool, params: JsonNode): ToolResult =
   if command == "":
     return newToolResult("command is required", true)
   
-  let timeout = params{"timeout"}.getInt(120)
+  let timeout = min(params{"timeout"}.getInt(120), 600)
+  let asyncMode = params{"async"}.getBool(false)
+  
+  if asyncMode:
+    # Background execution
+    try:
+      let process = startProcess(command, options = {poStdErrToStdOut, poDaemon}, workingDir = tool.workDir)
+      let job = jobsModule.globalJobManager.addJob(process, command)
+      return newToolResult("Started background job [" & $job.id & "] (PID: " & $job.pid & ")\nCommand: " & command & "\nUse 'jobs' to check status, 'kill' to stop.")
+    except CatchableError as e:
+      return newToolResult("Error starting background command: " & e.msg, true)
   
   try:
     let (output, exitCode) = execCmdEx(command, options = {}, workingDir = tool.workDir)
@@ -310,14 +415,15 @@ proc executeLs(tool: Tool, params: JsonNode): ToolResult =
   except CatchableError as e:
     return newToolResult("Error listing directory: " & e.msg, true)
 
-# Grep Tool
+# Grep Tool (with include and maxResults)
 proc grepToolParams(): JsonNode =
   %*{
     "type": "object",
     "properties": {
       "pattern": {"type": "string", "description": "Regex pattern to search for"},
-      "path": {"type": "string", "description": "Directory or file to search in"},
-      "include": {"type": "string", "description": "File pattern to include (e.g., '*.nim')"}
+      "path": {"type": "string", "description": "Directory or file to search in (default: current directory)"},
+      "include": {"type": "string", "description": "File pattern to include (e.g., '*.nim')"},
+      "maxResults": {"type": "integer", "description": "Maximum number of results (default 100)"}
     },
     "required": ["pattern"]
   }
@@ -333,9 +439,15 @@ proc executeGrep(tool: Tool, params: JsonNode): ToolResult =
   
   let fullPath = if path.isAbsolute: path else: tool.workDir / path
   let includePattern = params{"include"}.getStr("")
+  let maxResults = params{"maxResults"}.getInt(100)
   
   try:
-    let cmd = "grep -rn \"" & pattern & "\" " & fullPath
+    var cmd = "grep -rn"
+    if includePattern != "":
+      # Use --include for file pattern filtering
+      cmd.add(" --include=\"" & includePattern & "\"")
+    cmd.add(" \"" & pattern & "\" " & fullPath)
+    cmd.add(" 2>/dev/null | head -" & $maxResults)
     let (output, exitCode) = execCmdEx(cmd)
     
     if exitCode != 0 and output.len == 0:
@@ -349,13 +461,14 @@ proc executeGrep(tool: Tool, params: JsonNode): ToolResult =
   except CatchableError as e:
     return newToolResult("Error searching: " & e.msg, true)
 
-# Find Tool
+# Find Tool (with maxResults)
 proc findToolParams(): JsonNode =
   %*{
     "type": "object",
     "properties": {
       "pattern": {"type": "string", "description": "Glob pattern to match file names"},
-      "path": {"type": "string", "description": "Directory to search in"}
+      "path": {"type": "string", "description": "Directory to search in (default: current directory)"},
+      "maxResults": {"type": "integer", "description": "Maximum number of results (default 200)"}
     },
     "required": ["pattern"]
   }
@@ -370,9 +483,10 @@ proc executeFind(tool: Tool, params: JsonNode): ToolResult =
     path = tool.workDir
   
   let fullPath = if path.isAbsolute: path else: tool.workDir / path
+  let maxResults = params{"maxResults"}.getInt(200)
   
   try:
-    let cmd = "find " & fullPath & " -name \"" & pattern & "\" 2>/dev/null | head -200"
+    let cmd = "find " & fullPath & " -name \"" & pattern & "\" 2>/dev/null | head -" & $maxResults
     let (output, exitCode) = execCmdEx(cmd)
     
     if output.len == 0:
@@ -388,26 +502,46 @@ proc executeFind(tool: Tool, params: JsonNode): ToolResult =
 
 # Jobs Tool
 proc executeJobs(tool: Tool, params: JsonNode): ToolResult =
-  # This is a placeholder - in a real implementation, this would list background jobs
-  return newToolResult("No background jobs running")
+  let jobs = jobsModule.globalJobManager.listJobs()
+  if jobs.len == 0:
+    return newToolResult("No background jobs running")
+  
+  var result = ""
+  for job in jobs:
+    result.add(jobsModule.formatJobStatus(job) & "\n")
+  return newToolResult(result.strip)
 
 # Kill Tool
 proc executeKill(tool: Tool, params: JsonNode): ToolResult =
   let jobId = params{"jobId"}.getInt(0)
   if jobId == 0:
     return newToolResult("jobId is required", true)
-  # This is a placeholder - in a real implementation, this would kill a background job
-  return newToolResult("Job " & $jobId & " not found", true)
+  
+  if jobsModule.globalJobManager.killJob(jobId):
+    return newToolResult("Job " & $jobId & " killed")
+  return newToolResult("Job " & $jobId & " not found or already finished", true)
+
+# Skill Ref Tool
+proc skillRefToolParams(): JsonNode =
+  %*{
+    "type": "object",
+    "properties": {
+      "skill": {"type": "string", "description": "The skill name (directory name)"},
+      "ref": {"type": "string", "description": "The reference file path relative to the skill directory (e.g. 'references/audio.md')"}
+    },
+    "required": ["skill", "ref"]
+  }
 
 # Tool Registry
 type
   ToolRegistry* = ref object
     tools*: seq[Tool]
+    skillsDir*: string  ## Global skills directory for skill_ref
 
-proc newToolRegistry*(workDir: string): ToolRegistry =
-  result = ToolRegistry(tools: @[])
+proc newToolRegistry*(workDir: string, skillsDir: string = ""): ToolRegistry =
+  result = ToolRegistry(tools: @[], skillsDir: skillsDir)
   
-  result.tools.add(Tool(name: "read", description: "Read file contents", parameters: readToolParams(), workDir: workDir))
+  result.tools.add(Tool(name: "read", description: "Read file contents (supports text and images)", parameters: readToolParams(), workDir: workDir))
   result.tools.add(Tool(name: "write", description: "Write content to a file", parameters: writeToolParams(), workDir: workDir))
   result.tools.add(Tool(name: "edit", description: "Edit a file using exact text replacement", parameters: editToolParams(), workDir: workDir))
   result.tools.add(Tool(name: "bash", description: "Execute a shell command", parameters: bashToolParams(), workDir: workDir))
@@ -417,6 +551,7 @@ proc newToolRegistry*(workDir: string): ToolRegistry =
   result.tools.add(Tool(name: "plan", description: "Publish or update a structured task plan", parameters: planToolParams(), workDir: workDir))
   result.tools.add(Tool(name: "jobs", description: "List background jobs", parameters: listJobsToolParams(), workDir: workDir))
   result.tools.add(Tool(name: "kill", description: "Kill a running background job", parameters: killToolParams(), workDir: workDir))
+  result.tools.add(Tool(name: "skill_ref", description: "Load a reference file from an active skill. Use this to access on-demand knowledge from skills that have reference files.", parameters: skillRefToolParams(), workDir: workDir))
 
 proc getTool*(registry: ToolRegistry, name: string): Option[Tool] =
   for t in registry.tools:
@@ -450,4 +585,19 @@ proc execute*(registry: ToolRegistry, toolName: string, params: JsonNode): ToolR
   of "plan": return tool.executePlan(params)
   of "jobs": return tool.executeJobs(params)
   of "kill": return tool.executeKill(params)
+  of "skill_ref":
+    # Skill ref: load reference file from skills directory
+    let skillName = params{"skill"}.getStr("")
+    let refPath = params{"ref"}.getStr("")
+    if skillName == "" or refPath == "":
+      return newToolResult("skill and ref are required", true)
+    if registry.skillsDir == "":
+      return newToolResult("No skills directory configured", true)
+    let fullPath = registry.skillsDir / skillName / refPath
+    if not fileExists(fullPath):
+      return newToolResult("Reference file not found: " & fullPath, true)
+    try:
+      return newToolResult(readFile(fullPath))
+    except CatchableError as e:
+      return newToolResult("Error reading reference: " & e.msg, true)
   else: return newToolResult("Unknown tool: " & toolName, true)

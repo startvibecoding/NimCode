@@ -17,6 +17,12 @@ type
   ApprovalSettings* = object
     bashWhitelist*: seq[string]  ## Command prefixes that auto-approve in agent mode
     bashBlacklist*: seq[string]  ## Command prefixes that always require approval
+    confirmBeforeWrite*: bool   ## Require approval before write/edit tools
+
+  RetrySettings* = object
+    enabled*: bool
+    maxRetries*: int
+    baseDelayMs*: int
 
   Settings* = ref object
     providers*: Table[string, ProviderConfig]
@@ -27,6 +33,7 @@ type
     maxContextTokens*: int
     maxOutputTokens*: int
     approval*: ApprovalSettings
+    retry*: RetrySettings
 
 proc configDir*(): string =
   let home = getHomeDir()
@@ -95,7 +102,13 @@ proc defaultSettings*(): Settings =
     maxOutputTokens: 8192,
     approval: ApprovalSettings(
       bashWhitelist: @["go ", "make ", "git ", "nim ", "nimble "],
-      bashBlacklist: @[]
+      bashBlacklist: @[],
+      confirmBeforeWrite: false,
+    ),
+    retry: RetrySettings(
+      enabled: true,
+      maxRetries: 3,
+      baseDelayMs: 2000,
     ),
   )
 
@@ -134,7 +147,15 @@ proc settingsToJson(settings: Settings): JsonNode =
   # Approval settings
   result["approval"] = %*{
     "bashWhitelist": settings.approval.bashWhitelist,
-    "bashBlacklist": settings.approval.bashBlacklist
+    "bashBlacklist": settings.approval.bashBlacklist,
+    "confirmBeforeWrite": settings.approval.confirmBeforeWrite
+  }
+  
+  # Retry settings
+  result["retry"] = %*{
+    "enabled": settings.retry.enabled,
+    "maxRetries": settings.retry.maxRetries,
+    "baseDelayMs": settings.retry.baseDelayMs
   }
 
 proc ensureConfigExists(defaults: Settings) =
@@ -211,6 +232,28 @@ proc loadSettings*(): Settings =
         result.maxContextTokens = data["maxContextTokens"].getInt()
       if data.hasKey("maxOutputTokens"):
         result.maxOutputTokens = data["maxOutputTokens"].getInt()
+      # Parse approval
+      if data.hasKey("approval"):
+        let a = data["approval"]
+        if a.hasKey("bashWhitelist"):
+          result.approval.bashWhitelist = @[]
+          for v in a["bashWhitelist"]:
+            result.approval.bashWhitelist.add(v.getStr())
+        if a.hasKey("bashBlacklist"):
+          result.approval.bashBlacklist = @[]
+          for v in a["bashBlacklist"]:
+            result.approval.bashBlacklist.add(v.getStr())
+        if a.hasKey("confirmBeforeWrite"):
+          result.approval.confirmBeforeWrite = a["confirmBeforeWrite"].getBool(false)
+      # Parse retry
+      if data.hasKey("retry"):
+        let r = data["retry"]
+        if r.hasKey("enabled"):
+          result.retry.enabled = r["enabled"].getBool(true)
+        if r.hasKey("maxRetries"):
+          result.retry.maxRetries = r["maxRetries"].getInt(3)
+        if r.hasKey("baseDelayMs"):
+          result.retry.baseDelayMs = r["baseDelayMs"].getInt(2000)
       # Parse providers
       let parsed = parseProviders(data)
       if parsed.len > 0:
@@ -229,6 +272,8 @@ proc loadSettings*(): Settings =
         result.defaultModel = data["defaultModel"].getStr()
       if data.hasKey("defaultMode"):
         result.defaultMode = data["defaultMode"].getStr()
+      if data.hasKey("defaultThinkingLevel"):
+        result.defaultThinkingLevel = data["defaultThinkingLevel"].getStr()
       # Project providers merge/override global
       let parsed = parseProviders(data)
       if parsed.len > 0:

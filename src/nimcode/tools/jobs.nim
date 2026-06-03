@@ -96,3 +96,6 @@ proc killToolParams*(): JsonNode =
     },
     "required": ["jobId"]
   }
+
+# Global job manager instance
+var globalJobManager* = newJobManager()

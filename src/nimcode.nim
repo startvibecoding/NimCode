@@ -13,7 +13,7 @@ import nimcode/memory/memory
 import nimcode/tui/format
 import nimcode/gateway/gateway
 
-const VERSION = "0.1.0"
+const VERSION = "0.1.1"
 
 proc printHelp() =
   echo "NimCode - AI coding assistant v" & VERSION
@@ -24,9 +24,13 @@ proc printHelp() =
   echo "  -p, --provider <name>   Provider name (as defined in settings.json)"
   echo "  -m, --model <id>        Model ID"
   echo "  -M, --mode <mode>       Mode (plan, agent, yolo)"
+  echo "  -t, --thinking <level>  Thinking level (off, minimal, low, medium, high, xhigh)"
   echo "  -c, --continue          Continue most recent session"
+  echo "  -r, --resume <id>       Resume session by ID or path"
   echo "  --session <file>        Use specific session file"
-  echo "  -P, --print                 Print response and exit (non-interactive)"
+  echo "  -P, --print             Print response and exit (non-interactive)"
+  echo "  --verbose               Verbose output"
+  echo "  --debug                 Enable debug logging"
   echo "  -h, --help              Show this help"
   echo "  -v, --version           Show version"
   echo ""
@@ -34,8 +38,11 @@ proc printHelp() =
   echo "  nimcode                        Start interactive mode"
   echo "  nimcode -m gpt-4o              Use specific model"
   echo "  nimcode -M yolo                YOLO mode (all tools auto-execute)"
-  echo "  nimcode -p deepseek -m deepseek-chat  Use DeepSeek"
-  echo "  nimcode --print \"explain this\"  Print response and exit"
+  echo "  nimcode -p deepseek -m mimo-v2.5-pro  Use DeepSeek"
+  echo "  nimcode -t high                Enable high thinking level"
+  echo "  nimcode -P \"explain this\"      Print response and exit"
+  echo "  nimcode -c                     Continue last session"
+  echo "  nimcode -r <session-id>        Resume specific session"
   echo ""
 
 proc printVersion() =
@@ -55,11 +62,15 @@ proc run(args: seq[string], opts: var OptParser) =
   var providerName = ""
   var modelName = ""
   var mode = ""
+  var thinkingLevel = ""
   var continueSession = false
+  var resumeSession = ""
   var sessionFile = ""
   var printMode = false
   var gatewayMode = false
   var gatewayPort = "8080"
+  var verbose = false
+  var debug = false
   var messages: seq[string] = @[]
   
   # Parse options
@@ -77,12 +88,20 @@ proc run(args: seq[string], opts: var OptParser) =
         modelName = p.val
       of "M", "mode":
         mode = p.val
+      of "t", "thinking":
+        thinkingLevel = p.val
       of "c", "continue":
         continueSession = true
+      of "r", "resume":
+        resumeSession = p.val
       of "session":
         sessionFile = p.val
       of "P", "print":
         printMode = true
+      of "verbose":
+        verbose = true
+      of "debug":
+        debug = true
       of "gateway":
         gatewayMode = true
       of "port":
@@ -125,6 +144,10 @@ proc run(args: seq[string], opts: var OptParser) =
     mode = settings.defaultMode
   if mode == "":
     mode = "agent"
+  
+  # Determine thinking level
+  if thinkingLevel == "":
+    thinkingLevel = settings.defaultThinkingLevel
   
   # Get provider config
   let providerConfig = resolveProviderConfig(settings, providerName)
@@ -177,6 +200,9 @@ proc run(args: seq[string], opts: var OptParser) =
   if continueSession:
     sess = continueRecent(cwd)
     sessionInfo = sess.getSessionInfo()
+  elif resumeSession != "":
+    sess = openByPathOrID(cwd, resumeSession)
+    sessionInfo = sess.getSessionInfo()
   elif sessionFile != "":
     sess = openByPathOrID(cwd, sessionFile)
     sessionInfo = sess.getSessionInfo()
@@ -215,6 +241,8 @@ proc run(args: seq[string], opts: var OptParser) =
   echo formatMode(mode)
   echo "Provider: " & providerName
   echo "Model: " & modelName
+  if thinkingLevel != "":
+    echo "Thinking: " & thinkingLevel
   echo "Working directory: " & cwd
   echo ""
   
@@ -269,6 +297,7 @@ proc run(args: seq[string], opts: var OptParser) =
       echo "  mode     - Show current mode"
       echo "  provider - Show current provider"
       echo "  model    - Show current model"
+      echo "  thinking - Show thinking level"
       echo "  session  - Show session info"
       continue
     elif cmd == "mode":
@@ -279,6 +308,9 @@ proc run(args: seq[string], opts: var OptParser) =
       continue
     elif cmd == "model":
       echo "Model: " & modelName
+      continue
+    elif cmd == "thinking":
+      echo "Thinking: " & thinkingLevel
       continue
     elif cmd == "session":
       echo sess.getSessionInfo()
