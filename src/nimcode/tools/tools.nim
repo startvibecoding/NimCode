@@ -1,5 +1,6 @@
 import std/[json, os, osproc, strutils, options, algorithm, sequtils, times, streams, base64]
 import ../provider/types
+import ../cron/cron as cronModule
 import ./jobs as jobsModule
 
 # Plan Step
@@ -532,14 +533,64 @@ proc skillRefToolParams(): JsonNode =
     "required": ["skill", "ref"]
   }
 
+# Cron Tool
+proc cronToolParams(): JsonNode =
+  %*{
+    "type": "object",
+    "properties": {
+      "action": {"type": "string", "description": "Action: list, create, enable, disable, remove", "enum": ["list", "create", "enable", "disable", "remove"]},
+      "id": {"type": "string", "description": "Job ID (required for enable, disable, remove)"},
+      "name": {"type": "string", "description": "Short task name (required for create)"},
+      "prompt": {"type": "string", "description": "Task prompt for the sub-agent (required for create)"},
+      "schedule": {"type": "string", "description": "Schedule: @daily, @weekly, @monthly, @hourly, @every 30m, @every 2h, or empty for one-shot"},
+      "oneshot": {"type": "boolean", "description": "If true, run once then auto-disable (default: false)"},
+      "mode": {"type": "string", "description": "Agent mode for the task: agent, yolo (default: yolo)", "enum": ["agent", "yolo"]}
+    },
+    "required": ["action"]
+  }
+
+proc executeCron(tool: Tool, params: JsonNode, cronStore: cronModule.CronStore): ToolResult =
+  let action = params{"action"}.getStr("")
+  try:
+    case action
+    of "list":
+      return newToolResult(cronStore.formatJobs())
+    of "create":
+      let name = params{"name"}.getStr("")
+      let prompt = params{"prompt"}.getStr("")
+      let schedule = params{"schedule"}.getStr("")
+      let oneShot = params{"oneshot"}.getBool(false)
+      let mode = params{"mode"}.getStr("yolo")
+      let job = cronStore.create(name, prompt, schedule, oneShot, mode)
+      let kind = if job.oneShot: "one-shot" else: "periodic"
+      return newToolResult("Cron job created (" & kind & "):\n  ID: " & job.id & "\n  Name: " & job.name & "\n  Schedule: " & cronModule.formatSchedule(job.schedule, job.oneShot) & "\n  Mode: " & job.mode & "\n  Prompt: " & job.prompt[0 ..< min(job.prompt.len, 100)])
+    of "enable":
+      let id = params{"id"}.getStr("")
+      cronStore.setEnabled(id, true)
+      return newToolResult("Cron job enabled: " & id)
+    of "disable":
+      let id = params{"id"}.getStr("")
+      cronStore.setEnabled(id, false)
+      return newToolResult("Cron job disabled: " & id)
+    of "remove":
+      let id = params{"id"}.getStr("")
+      cronStore.remove(id)
+      return newToolResult("Cron job removed: " & id)
+    else:
+      return newToolResult("Unknown cron action: " & action & " (use: list, create, enable, disable, remove)", true)
+  except CatchableError as e:
+    return newToolResult("Cron error: " & e.msg, true)
+
 # Tool Registry
 type
   ToolRegistry* = ref object
     tools*: seq[Tool]
     skillsDir*: string  ## Global skills directory for skill_ref
+    cronStore*: cronModule.CronStore  ## Cron job store
 
 proc newToolRegistry*(workDir: string, skillsDir: string = ""): ToolRegistry =
-  result = ToolRegistry(tools: @[], skillsDir: skillsDir)
+  let cronPath = getConfigDir() / ".nimcode" / "cron.json"
+  result = ToolRegistry(tools: @[], skillsDir: skillsDir, cronStore: cronModule.newCronStore(cronPath))
   
   result.tools.add(Tool(name: "read", description: "Read file contents (supports text and images)", parameters: readToolParams(), workDir: workDir))
   result.tools.add(Tool(name: "write", description: "Write content to a file", parameters: writeToolParams(), workDir: workDir))
@@ -551,6 +602,7 @@ proc newToolRegistry*(workDir: string, skillsDir: string = ""): ToolRegistry =
   result.tools.add(Tool(name: "plan", description: "Publish or update a structured task plan", parameters: planToolParams(), workDir: workDir))
   result.tools.add(Tool(name: "jobs", description: "List background jobs", parameters: listJobsToolParams(), workDir: workDir))
   result.tools.add(Tool(name: "kill", description: "Kill a running background job", parameters: killToolParams(), workDir: workDir))
+  result.tools.add(Tool(name: "cron", description: "Manage scheduled tasks (cron jobs). Create one-time or periodic background tasks.", parameters: cronToolParams(), workDir: workDir))
   result.tools.add(Tool(name: "skill_ref", description: "Load a reference file from an active skill. Use this to access on-demand knowledge from skills that have reference files.", parameters: skillRefToolParams(), workDir: workDir))
 
 proc getTool*(registry: ToolRegistry, name: string): Option[Tool] =
@@ -585,6 +637,7 @@ proc execute*(registry: ToolRegistry, toolName: string, params: JsonNode): ToolR
   of "plan": return tool.executePlan(params)
   of "jobs": return tool.executeJobs(params)
   of "kill": return tool.executeKill(params)
+  of "cron": return tool.executeCron(params, registry.cronStore)
   of "skill_ref":
     # Skill ref: load reference file from skills directory
     let skillName = params{"skill"}.getStr("")

@@ -298,23 +298,6 @@ proc parseProviders(data: JsonNode): Table[string, ProviderConfig] =
     pc.models = @[]
     if pNode.hasKey("models"):
       pc.models = parseModels(pNode["models"])
-    result[name] = proc =
-      result = pc
-
-  # Fix: direct assignment
-  result = initTable[string, ProviderConfig]()
-  for name, pNode in providersNode:
-    var pc = ProviderConfig()
-    pc.apiKey = pNode{"apiKey"}.getStr("")
-    pc.baseUrl = pNode{"baseUrl"}.getStr("")
-    pc.api = pNode{"api"}.getStr("")
-    pc.vendor = pNode{"vendor"}.getStr("")
-    pc.thinkingFormat = pNode{"thinkingFormat"}.getStr("")
-    pc.cacheControl = pNode{"cacheControl"}.getBool(false)
-    pc.httpProxy = pNode{"httpProxy"}.getStr("")
-    pc.models = @[]
-    if pNode.hasKey("models"):
-      pc.models = parseModels(pNode["models"])
     result[name] = pc
 
 proc parseMCPHeader(node: JsonNode): MCPHeader =

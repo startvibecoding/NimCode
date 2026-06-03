@@ -26,8 +26,11 @@ proc detectApiType*(baseUrl: string, api: string): string =
   if lower.contains("google") or lower.contains("gemini") or lower.contains("generativelanguage"):
     return "google-gemini"
   
-  # OpenAI Responses API (for o1/o3 with reasoning)
-  # Default to chat completions
+  # Google Vertex
+  if lower.contains("vertex") or lower.contains("aiplatform"):
+    return "google-gemini"
+  
+  # Default to OpenAI chat completions
   return "openai-chat"
 
 proc createProvider*(providerConfig: ProviderConfig, retrySettings: RetrySettings): Provider =
@@ -40,10 +43,15 @@ proc createProvider*(providerConfig: ProviderConfig, retrySettings: RetrySetting
   
   case apiType
   of "anthropic-messages":
-    return newAnthropicProvider(apiKey, providerConfig.baseUrl,
+    let p = newAnthropicProvider(apiKey, providerConfig.baseUrl,
       retryEnabled = retrySettings.enabled,
       maxRetries = retrySettings.maxRetries,
       baseDelayMs = retrySettings.baseDelayMs)
+    if providerConfig.thinkingFormat != "":
+      p.thinkingFormat = providerConfig.thinkingFormat
+    if providerConfig.cacheControl:
+      p.cacheControlEnabled = true
+    return p
   
   of "google-gemini":
     return newGoogleGeminiProvider(apiKey, providerConfig.baseUrl,
@@ -57,10 +65,22 @@ proc createProvider*(providerConfig: ProviderConfig, retrySettings: RetrySetting
       maxRetries = retrySettings.maxRetries,
       baseDelayMs = retrySettings.baseDelayMs)
     p.useResponsesApi = true
+    if providerConfig.thinkingFormat != "":
+      p.thinkingFormat = providerConfig.thinkingFormat
     return p
   
   else: # "openai-chat" or any other
-    return newOpenAiProvider(apiKey, providerConfig.baseUrl,
+    let p = newOpenAiProvider(apiKey, providerConfig.baseUrl,
       retryEnabled = retrySettings.enabled,
       maxRetries = retrySettings.maxRetries,
       baseDelayMs = retrySettings.baseDelayMs)
+    if providerConfig.thinkingFormat != "":
+      p.thinkingFormat = providerConfig.thinkingFormat
+    return p
+
+proc createProviderFromSettings*(settings: Settings, providerName: string): Provider =
+  ## Create a provider from settings with full config resolution
+  let pcOpt = settings.getProviderConfig(providerName)
+  if pcOpt.isNone:
+    raise newException(CatchableError, "Provider not found: " & providerName)
+  return createProvider(pcOpt.get(), settings.retry)

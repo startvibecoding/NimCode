@@ -22,7 +22,7 @@ type
     extraContext*: string  ## Extra context from context files and skills
     contextWindow*: int    ## Maximum context window size
     settings*: Settings    ## Settings for approval rules
-    compactionSettings*: CompactionSettings
+    compactionSettings*: contextModule.CompactionSettings
     thinkingLevel*: ThinkingLevel  ## Thinking/reasoning level
 
 proc newAgent*(
