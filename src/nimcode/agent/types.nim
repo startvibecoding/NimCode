@@ -3,6 +3,7 @@ import std/[json]
 type
   AgentEventKind* = enum
     aekTextDelta = "text_delta"
+    aekThinkDelta = "think_delta"
     aekToolCall = "tool_call"
     aekToolResult = "tool_result"
     aekDone = "done"
@@ -12,6 +13,8 @@ type
     case kind*: AgentEventKind
     of aekTextDelta:
       textDelta*: string
+    of aekThinkDelta:
+      thinkDelta*: string
     of aekToolCall:
       toolCallId*: string
       toolName*: string

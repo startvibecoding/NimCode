@@ -23,6 +23,7 @@ type
     contextWindow*: int    ## Maximum context window size
     settings*: Settings    ## Settings for approval rules
     compactionSettings*: CompactionSettings
+    thinkingLevel*: ThinkingLevel  ## Thinking/reasoning level
 
 proc newAgent*(
   provider: Provider,
@@ -33,7 +34,8 @@ proc newAgent*(
   maxTokens: int = 8192,
   extraContext: string = "",
   contextWindow: int = 128000,
-  settings: Settings = nil
+  settings: Settings = nil,
+  thinkingLevel: ThinkingLevel = tlOff
 ): Agent =
   var compaction = defaultCompactionSettings()
   if settings != nil:
@@ -50,7 +52,8 @@ proc newAgent*(
     extraContext: extraContext,
     contextWindow: contextWindow,
     settings: settings,
-    compactionSettings: compaction
+    compactionSettings: compaction,
+    thinkingLevel: thinkingLevel,
   )
 
 proc clearMessages*(agent: Agent) =
@@ -129,7 +132,6 @@ proc processAgentTurn*(agent: Agent, userMsg: string): seq[AgentEvent] =
 
 proc processAgentTurnStream*(agent: Agent, userMsg: string, callback: AgentEventCallback) =
   ## Streaming agent turn: invokes callback for each event as it arrives from the LLM.
-  ## This enables real-time token-by-token display in CLI/TUI.
   
   # Add user message
   agent.messages.add(newUserMessage(userMsg))
@@ -157,7 +159,8 @@ proc processAgentTurnStream*(agent: Agent, userMsg: string, callback: AgentEvent
       tools: agent.registry.definitions(),
       systemPrompt: systemPrompt,
       maxTokens: agent.maxTokens,
-      modelId: agent.modelId
+      modelId: agent.modelId,
+      thinkingLevel: agent.thinkingLevel,
     )
     
     # Stream events from provider — callback is invoked per-token
@@ -171,12 +174,17 @@ proc processAgentTurnStream*(agent: Agent, userMsg: string, callback: AgentEvent
       of setTextDelta:
         textContent.add(event.textDelta)
         callback(AgentEvent(kind: aekTextDelta, textDelta: event.textDelta))
+      of setThinkDelta:
+        callback(AgentEvent(kind: aekThinkDelta, thinkDelta: event.thinkDelta))
       of setToolCall:
         toolCalls.add((event.toolCallId, event.toolName, event.toolArgs))
         callback(AgentEvent(kind: aekToolCall, toolCallId: event.toolCallId, toolName: event.toolName, toolArgs: event.toolArgs))
       of setError:
         callback(AgentEvent(kind: aekError, errorMsg: event.error))
         hasError = true
+      of setRetry:
+        # Report retry attempts to the user
+        callback(AgentEvent(kind: aekTextDelta, textDelta: "[Retry " & $event.retryAttempt & "/" & $event.retryMax & ": " & event.retryError & "]\n"))
       of setDone:
         isDone = true
       of setUsage, setStart:

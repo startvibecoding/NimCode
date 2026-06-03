@@ -12,12 +12,52 @@ type
     apiKey*: string
     baseUrl*: string
     api*: string
+    vendor*: string           ## Explicit vendor adapter name
+    thinkingFormat*: string   ## "", "openai", "anthropic", "deepseek", "xiaomi"
+    cacheControl*: bool       ## Enable Anthropic prompt caching
+    httpProxy*: string        ## Per-provider HTTP proxy URL
     models*: seq[ModelConfig]
+
+  WebSearchSettings* = object
+    enabled*: bool
+    provider*: string
+    providerType*: string     ## "responses" or "messages"
+
+  CompactionSettings* = object
+    enabled*: bool
+    reserveTokens*: int
+    keepRecentTokens*: int
+
+  SandboxSettings* = object
+    enabled*: bool
+    level*: string            ## "none", "standard", "strict"
+    bwrapPath*: string
+    allowNetwork*: bool
+
+  MCPHeader* = object
+    name*: string
+    value*: string
+
+  MCPEnvVar* = object
+    name*: string
+    value*: string
+
+  MCPServerConfig* = object
+    name*: string
+    kind*: string             ## "stdio", "http", "sse" (default: stdio)
+    command*: string           ## For stdio: absolute path to binary
+    args*: seq[string]
+    env*: seq[MCPEnvVar]
+    url*: string              ## For http/sse: server URL
+    headers*: seq[MCPHeader]
+
+  MCPConfig* = object
+    servers*: seq[MCPServerConfig]
 
   ApprovalSettings* = object
     bashWhitelist*: seq[string]  ## Command prefixes that auto-approve in agent mode
     bashBlacklist*: seq[string]  ## Command prefixes that always require approval
-    confirmBeforeWrite*: bool   ## Require approval before write/edit tools
+    confirmBeforeWrite*: bool    ## Require approval before write/edit tools
 
   RetrySettings* = object
     enabled*: bool
@@ -32,8 +72,18 @@ type
     defaultThinkingLevel*: string
     maxContextTokens*: int
     maxOutputTokens*: int
+    webSearch*: WebSearchSettings
+    compaction*: CompactionSettings
+    sandbox*: SandboxSettings
+    sessionDir*: string
+    skillsDir*: string
+    contextFiles*: ContextFilesSettings
     approval*: ApprovalSettings
     retry*: RetrySettings
+
+  ContextFilesSettings* = object
+    enabled*: bool
+    extraFiles*: seq[string]
 
 proc configDir*(): string =
   let home = getHomeDir()
@@ -44,6 +94,12 @@ proc globalSettingsPath*(): string =
 
 proc projectSettingsPath*(): string =
   ".nimcode" / "settings.json"
+
+proc globalMCPPath*(): string =
+  configDir() / "mcp.json"
+
+proc projectMCPPath*(): string =
+  ".nimcode" / "mcp.json"
 
 proc resolveKey*(provider: ProviderConfig): string =
   ## Resolve API key, supporting ${VAR} syntax
@@ -100,6 +156,12 @@ proc defaultSettings*(): Settings =
     defaultThinkingLevel: "medium",
     maxContextTokens: 128000,
     maxOutputTokens: 8192,
+    webSearch: WebSearchSettings(enabled: false, providerType: "responses"),
+    compaction: CompactionSettings(enabled: true, reserveTokens: 16384, keepRecentTokens: 20000),
+    sandbox: SandboxSettings(enabled: false, level: "none"),
+    sessionDir: "",
+    skillsDir: "",
+    contextFiles: ContextFilesSettings(enabled: true),
     approval: ApprovalSettings(
       bashWhitelist: @["go ", "make ", "git ", "nim ", "nimble "],
       bashBlacklist: @[],
@@ -123,6 +185,10 @@ proc settingsToJson(settings: Settings): JsonNode =
     providerJson["apiKey"] = %provider.apiKey
     providerJson["baseUrl"] = %provider.baseUrl
     providerJson["api"] = %provider.api
+    if provider.vendor != "": providerJson["vendor"] = %provider.vendor
+    if provider.thinkingFormat != "": providerJson["thinkingFormat"] = %provider.thinkingFormat
+    if provider.cacheControl: providerJson["cacheControl"] = %true
+    if provider.httpProxy != "": providerJson["httpProxy"] = %provider.httpProxy
     
     var models = newJArray()
     for model in provider.models:
@@ -143,6 +209,27 @@ proc settingsToJson(settings: Settings): JsonNode =
   result["defaultThinkingLevel"] = %settings.defaultThinkingLevel
   result["maxContextTokens"] = %settings.maxContextTokens
   result["maxOutputTokens"] = %settings.maxOutputTokens
+  
+  # Web search
+  result["webSearch"] = %*{
+    "enabled": settings.webSearch.enabled,
+    "provider": settings.webSearch.provider,
+    "providerType": settings.webSearch.providerType
+  }
+  
+  # Compaction
+  result["compaction"] = %*{
+    "enabled": settings.compaction.enabled,
+    "reserveTokens": settings.compaction.reserveTokens,
+    "keepRecentTokens": settings.compaction.keepRecentTokens
+  }
+  
+  # Sandbox
+  result["sandbox"] = %*{
+    "enabled": settings.sandbox.enabled,
+    "level": settings.sandbox.level,
+    "allowNetwork": settings.sandbox.allowNetwork
+  }
   
   # Approval settings
   result["approval"] = %*{
@@ -183,6 +270,17 @@ proc ensureProjectConfigExists*() =
     except:
       discard
 
+proc parseModels(modelsNode: JsonNode): seq[ModelConfig] =
+  result = @[]
+  for mNode in modelsNode:
+    var mc = ModelConfig()
+    mc.id = mNode{"id"}.getStr("")
+    mc.name = mNode{"name"}.getStr("")
+    mc.reasoning = mNode{"reasoning"}.getBool(false)
+    mc.contextWindow = mNode{"contextWindow"}.getInt(0)
+    mc.maxTokens = mNode{"maxTokens"}.getInt(0)
+    result.add(mc)
+
 proc parseProviders(data: JsonNode): Table[string, ProviderConfig] =
   ## Parse providers from JSON data
   result = initTable[string, ProviderConfig]()
@@ -190,23 +288,69 @@ proc parseProviders(data: JsonNode): Table[string, ProviderConfig] =
   let providersNode = data["providers"]
   for name, pNode in providersNode:
     var pc = ProviderConfig()
-    if pNode.hasKey("apiKey"):
-      pc.apiKey = pNode["apiKey"].getStr("")
-    if pNode.hasKey("baseUrl"):
-      pc.baseUrl = pNode["baseUrl"].getStr("")
-    if pNode.hasKey("api"):
-      pc.api = pNode["api"].getStr("")
+    pc.apiKey = pNode{"apiKey"}.getStr("")
+    pc.baseUrl = pNode{"baseUrl"}.getStr("")
+    pc.api = pNode{"api"}.getStr("")
+    pc.vendor = pNode{"vendor"}.getStr("")
+    pc.thinkingFormat = pNode{"thinkingFormat"}.getStr("")
+    pc.cacheControl = pNode{"cacheControl"}.getBool(false)
+    pc.httpProxy = pNode{"httpProxy"}.getStr("")
     pc.models = @[]
     if pNode.hasKey("models"):
-      for mNode in pNode["models"]:
-        var mc = ModelConfig()
-        mc.id = mNode{"id"}.getStr("")
-        mc.name = mNode{"name"}.getStr("")
-        mc.reasoning = mNode{"reasoning"}.getBool(false)
-        mc.contextWindow = mNode{"contextWindow"}.getInt(0)
-        mc.maxTokens = mNode{"maxTokens"}.getInt(0)
-        pc.models.add(mc)
+      pc.models = parseModels(pNode["models"])
+    result[name] = proc =
+      result = pc
+
+  # Fix: direct assignment
+  result = initTable[string, ProviderConfig]()
+  for name, pNode in providersNode:
+    var pc = ProviderConfig()
+    pc.apiKey = pNode{"apiKey"}.getStr("")
+    pc.baseUrl = pNode{"baseUrl"}.getStr("")
+    pc.api = pNode{"api"}.getStr("")
+    pc.vendor = pNode{"vendor"}.getStr("")
+    pc.thinkingFormat = pNode{"thinkingFormat"}.getStr("")
+    pc.cacheControl = pNode{"cacheControl"}.getBool(false)
+    pc.httpProxy = pNode{"httpProxy"}.getStr("")
+    pc.models = @[]
+    if pNode.hasKey("models"):
+      pc.models = parseModels(pNode["models"])
     result[name] = pc
+
+proc parseMCPHeader(node: JsonNode): MCPHeader =
+  result.name = node{"name"}.getStr("")
+  result.value = node{"value"}.getStr("")
+
+proc parseMCPEnvVar(node: JsonNode): MCPEnvVar =
+  result.name = node{"name"}.getStr("")
+  result.value = node{"value"}.getStr("")
+
+proc loadMCPConfig*(path: string): MCPConfig =
+  ## Load MCP configuration from a JSON file
+  result = MCPConfig()
+  if not fileExists(path):
+    return
+  try:
+    let data = parseFile(path)
+    if not data.hasKey("mcpServers"): return
+    for name, srvNode in data["mcpServers"]:
+      var srv = MCPServerConfig()
+      srv.name = name
+      srv.kind = srvNode{"type"}.getStr("stdio")
+      srv.command = srvNode{"command"}.getStr("")
+      srv.url = srvNode{"url"}.getStr("")
+      if srvNode.hasKey("args"):
+        for arg in srvNode["args"]:
+          srv.args.add(arg.getStr(""))
+      if srvNode.hasKey("env"):
+        for envNode in srvNode["env"]:
+          srv.env.add(parseMCPEnvVar(envNode))
+      if srvNode.hasKey("headers"):
+        for hNode in srvNode["headers"]:
+          srv.headers.add(parseMCPHeader(hNode))
+      result.servers.add(srv)
+  except:
+    discard
 
 proc loadSettings*(): Settings =
   result = defaultSettings()
@@ -232,6 +376,42 @@ proc loadSettings*(): Settings =
         result.maxContextTokens = data["maxContextTokens"].getInt()
       if data.hasKey("maxOutputTokens"):
         result.maxOutputTokens = data["maxOutputTokens"].getInt()
+      if data.hasKey("sessionDir"):
+        result.sessionDir = data["sessionDir"].getStr()
+      if data.hasKey("skillsDir"):
+        result.skillsDir = data["skillsDir"].getStr()
+      
+      # Parse web search
+      if data.hasKey("webSearch"):
+        let ws = data["webSearch"]
+        if ws.hasKey("enabled"): result.webSearch.enabled = ws["enabled"].getBool(false)
+        if ws.hasKey("provider"): result.webSearch.provider = ws["provider"].getStr()
+        if ws.hasKey("providerType"): result.webSearch.providerType = ws["providerType"].getStr()
+      
+      # Parse compaction
+      if data.hasKey("compaction"):
+        let cp = data["compaction"]
+        if cp.hasKey("enabled"): result.compaction.enabled = cp["enabled"].getBool(true)
+        if cp.hasKey("reserveTokens"): result.compaction.reserveTokens = cp["reserveTokens"].getInt(16384)
+        if cp.hasKey("keepRecentTokens"): result.compaction.keepRecentTokens = cp["keepRecentTokens"].getInt(20000)
+      
+      # Parse sandbox
+      if data.hasKey("sandbox"):
+        let sb = data["sandbox"]
+        if sb.hasKey("enabled"): result.sandbox.enabled = sb["enabled"].getBool(false)
+        if sb.hasKey("level"): result.sandbox.level = sb["level"].getStr("none")
+        if sb.hasKey("bwrapPath"): result.sandbox.bwrapPath = sb["bwrapPath"].getStr()
+        if sb.hasKey("allowNetwork"): result.sandbox.allowNetwork = sb["allowNetwork"].getBool(false)
+      
+      # Parse context files
+      if data.hasKey("contextFiles"):
+        let cf = data["contextFiles"]
+        if cf.hasKey("enabled"): result.contextFiles.enabled = cf["enabled"].getBool(true)
+        if cf.hasKey("extraFiles"):
+          result.contextFiles.extraFiles = @[]
+          for f in cf["extraFiles"]:
+            result.contextFiles.extraFiles.add(f.getStr())
+      
       # Parse approval
       if data.hasKey("approval"):
         let a = data["approval"]

@@ -63,6 +63,10 @@ proc cliStreamCallback(event: AgentEvent) =
   of aekTextDelta:
     stdout.write(event.textDelta)
     stdout.flushFile()
+  of aekThinkDelta:
+    # Show thinking in a dim style
+    stderr.write(event.thinkDelta)
+    stderr.flushFile()
   of aekToolCall:
     stdout.write("\n")
     stdout.write(formatToolCall(event.toolName, "{}"))
@@ -179,11 +183,24 @@ proc run(args: seq[string], opts: var OptParser) =
   # Create provider based on API type
   var provider: Provider
   if providerConfig.api == "anthropic-messages":
-    provider = newAnthropicProvider(apiKey, providerConfig.baseUrl)
+    provider = newAnthropicProvider(apiKey, providerConfig.baseUrl,
+      retryEnabled = settings.retry.enabled,
+      maxRetries = settings.retry.maxRetries,
+      baseDelayMs = settings.retry.baseDelayMs)
   elif providerConfig.api == "google-gemini":
-    provider = newGoogleGeminiProvider(apiKey, providerConfig.baseUrl)
+    provider = newGoogleGeminiProvider(apiKey, providerConfig.baseUrl,
+      retryEnabled = settings.retry.enabled,
+      maxRetries = settings.retry.maxRetries,
+      baseDelayMs = settings.retry.baseDelayMs)
   else:
-    provider = newOpenAiProvider(apiKey, providerConfig.baseUrl)
+    let openaiProv = newOpenAiProvider(apiKey, providerConfig.baseUrl,
+      retryEnabled = settings.retry.enabled,
+      maxRetries = settings.retry.maxRetries,
+      baseDelayMs = settings.retry.baseDelayMs)
+    # Enable Responses API for openai-responses type
+    if providerConfig.api == "openai-responses":
+      openaiProv.useResponsesApi = true
+    provider = openaiProv
   
   let cwd = getCurrentDir()
   
@@ -222,11 +239,15 @@ proc run(args: seq[string], opts: var OptParser) =
   else:
     sess = newSession(cwd)
   
+  # Parse thinking level
+  let parsedThinkingLevel = if thinkingLevel != "": parseThinkingLevel(thinkingLevel) else: tlOff
+  
   # Create agent
   let agent = newAgent(
     provider, modelName, mode, cwd, sess,
     extraContext = extraContext,
-    settings = settings
+    settings = settings,
+    thinkingLevel = parsedThinkingLevel
   )
   
   # Print mode: stream directly to stdout
