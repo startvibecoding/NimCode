@@ -1,0 +1,25 @@
+# Nim compiled
+*.exe
+*.out
+nimcache/
+nimblecache/
+
+# Binary
+bin/nimcode
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Sessions (local data)
+.nimcode/
+
+# Nimble
+*.nimble.lock
