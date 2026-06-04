@@ -84,6 +84,16 @@ suite "Stream Callbacks":
     let event = AgentEvent(kind: aekDone, doneStopReason: "stop")
     # Would test callback here
   
+  test "TUI callback structure test":
+    let tui = newTuiState()
+    let statusBar = newStatusBarState(tui)
+    let state = newStreamCallbackState(scmTui, tui, statusBar)
+    
+    # Test that callback state is properly initialized
+    check state.assistantStarted == false
+    check state.thinkStarted == false
+    check state.mode == scmTui
+  
   test "Print callback handles text delta":
     let state = newStreamCallbackState(scmPrint)
     
