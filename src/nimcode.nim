@@ -1,4 +1,7 @@
-import std/[os, strutils, parseopt, options, json, tables, sequtils, asyncdispatch, times, terminal, posix, termios]
+## NimCode - AI coding assistant
+## Main entry point
+
+import std/[os, strutils, parseopt, options, json, tables, sequtils, asyncdispatch, times]
 import nimcode/config/config
 import nimcode/provider/types
 import nimcode/provider/factory
@@ -10,130 +13,19 @@ import nimcode/skills/skills
 import nimcode/memory/memory
 import nimcode/tui/format
 import nimcode/tui/tui
+import nimcode/tui/input
+import nimcode/tui/statusbar
+import nimcode/cli/stream
 import nimcode/gateway/gateway
 import nimcode/mcp/mcp as mcpModule
 import nimcode/sandbox/sandbox as sandboxModule
 import nimcode/cron/cron as cronModule
 import nimcode/a2a/a2a as a2aModule
 
-# Global flag for interrupting agent
-var gInterruptRequested* = false
-
-# TUI state
-var gTui: TuiState
-
-# Terminal raw mode
-var gOrigTermios: Termios
-var gRawModeEnabled = false
-
-proc enableRawMode() =
-  if not stdin.isatty(): return
-  if tcgetattr(0, addr gOrigTermios) == -1: return
-  var raw = gOrigTermios
-  raw.c_iflag = raw.c_iflag and not (BRKINT or ICRNL or INPCK or ISTRIP or IXON)
-  raw.c_oflag = raw.c_oflag and not OPOST
-  raw.c_cflag = raw.c_cflag or CS8
-  raw.c_lflag = raw.c_lflag and not (ECHO or ICANON or IEXTEN or ISIG)
-  raw.c_cc[VMIN] = 1.char
-  raw.c_cc[VTIME] = 0.char
-  if tcsetattr(0, TCSAFLUSH, addr raw) == -1: return
-  gRawModeEnabled = true
-
-proc disableRawMode() =
-  if gRawModeEnabled:
-    discard tcsetattr(0, TCSAFLUSH, addr gOrigTermios)
-    gRawModeEnabled = false
-
-proc readUtf8Char(): string =
-  ## Read one UTF-8 character (may be multi-byte)
-  var buf: array[4, char]
-  if read(0, addr buf[0], 1) != 1: return ""
-  
-  let b = buf[0].ord
-  var len = 1
-  if (b and 0xE0) == 0xC0: len = 2
-  elif (b and 0xF0) == 0xE0: len = 3
-  elif (b and 0xF8) == 0xF0: len = 4
-  
-  for i in 1 ..< len:
-    if read(0, addr buf[i], 1) != 1: break
-  
-  result = newString(len)
-  for i in 0 ..< len:
-    result[i] = buf[i]
-
-proc readLineWithTab*(): tuple[line: string, tabPressed: bool] =
-  ## Read line with raw mode, intercept Tab for mode cycling
-  enableRawMode()
-  defer: disableRawMode()
-  
-  var buffer = ""
-  while true:
-    let ch = readUtf8Char()
-    if ch.len == 0: continue
-    
-    # Single byte special keys
-    if ch.len == 1:
-      case ch[0]
-      of '\t':  # Tab
-        return ("", true)
-      of '\n', '\r':  # Enter
-        return (buffer, false)
-      of '\x7f', '\b':  # Backspace
-        if buffer.len > 0:
-          # Find last UTF-8 character boundary
-          var lastLen = 1
-          var i = buffer.len - 1
-          while i > 0 and (buffer[i].ord and 0xC0) == 0x80:
-            dec i
-            inc lastLen
-          buffer.setLen(buffer.len - lastLen)
-          # Erase from screen
-          stdout.write("\b \b")
-          stdout.flushFile()
-      of '\x03':  # Ctrl+C
-        quit(0)
-      of '\x04':  # Ctrl+D
-        if buffer.len == 0: quit(0)
-      of '\x1b':  # ESC or escape sequence
-        discard  # Ignore for now
-      else:
-        if ch[0] >= ' ':
-          buffer.add(ch)
-          stdout.write(ch)
-          stdout.flushFile()
-    else:
-      # Multi-byte UTF-8 (Chinese, etc.)
-      buffer.add(ch)
-      stdout.write(ch)
-      stdout.flushFile()
-
-proc checkForKeyPress(): char =
-  ## Non-blocking check for key press
-  if not stdin.isatty():
-    return '\0'
-  try:
-    # Check if there's input available
-    if not stdin.endOfFile():
-      return stdin.readChar()
-  except:
-    discard
-  return '\0'
-
-proc handleKeyboardInput() =
-  ## Non-blocking keyboard input check for ESC and Tab
-  let ch = checkForKeyPress()
-  case ch
-  of '\x1b':  # ESC key
-    gInterruptRequested = true
-    stderr.writeLine("\n" & yellow("Interrupted by user"))
-  of '\t':  # Tab key
-    # Toggle mode - will be handled in main loop
-    discard
-  else:
-    discard
-
 const VERSION = "0.1.2"
+
+# Global state
+var gInterruptRequested* = false
 
 proc printHelp() =
   echo "NimCode - AI coding assistant v" & VERSION
@@ -168,7 +60,6 @@ proc printHelp() =
   echo "  nimcode -P \"explain this\"      Print response and exit"
   echo "  nimcode -c                     Continue last session"
   echo "  nimcode -r <session-id>        Resume specific session"
-  echo ""
 
 proc printVersion() =
   echo "NimCode v" & VERSION
@@ -182,134 +73,6 @@ proc resolveProviderConfig*(settings: Settings, name: string): ProviderConfig =
     return defaultOpt.get()
   raise newException(CatchableError, "Provider not found: " & name)
 
-# Track assistant output state
-var gAssistantStarted = false
-var gThinkStarted = false
-var gLastDuration: float = 0
-var gStartTime: float = 0
-var gIsStreaming = false
-
-# Status bar helpers
-proc getUsageInfo(agent: Agent): tuple[percent: float, window: int] =
-  let usage = agent.getContextUsage()
-  let percent = if usage.percent.isSome: usage.percent.get else: 0.0
-  let window = if usage.contextWindow > 0: usage.contextWindow else: 128000
-  return (percent, window)
-
-proc buildStatusBarText(mode, modelName, cwd: string, usagePercent: float, contextWindow: int, lastDuration: float = 0, isStreaming: bool = false): string =
-  var parts: seq[string] = @[]
-  
-  # Mode with emoji
-  let modeStr = case mode
-    of "plan": "📝 PLAN"
-    of "agent": "🤖 AGENT"
-    of "yolo": "🚀 YOLO"
-    else: "⚙️ " & mode.toUpper
-  if isStreaming:
-    parts.add(modeStr & " ●")
-  else:
-    parts.add(modeStr)
-  
-  parts.add(modelName)
-  
-  let shortDir = if cwd.len > 25: "..." & cwd[^22..^1] else: cwd
-  parts.add(shortDir)
-  
-  if contextWindow > 0:
-    let percentStr = formatFloat(usagePercent, ffDecimal, 1) & "%"
-    let windowStr = if contextWindow >= 1000:
-      formatFloat(contextWindow.float / 1000.0, ffDecimal, 0) & "k"
-    else:
-      $contextWindow
-    parts.add(percentStr & "/" & windowStr)
-  
-  if lastDuration > 0:
-    parts.add("last " & formatFloat(lastDuration, ffDecimal, 0) & "s")
-  
-  parts.add("Tab:mode Esc:abort Ctrl+C:exit")
-  
-  return parts.join(" │ ")
-
-proc updateStatusBar(agent: Agent, mode, modelName, cwd: string, lastDuration: float = 0, isStreaming: bool = false) =
-  let (percent, window) = getUsageInfo(agent)
-  let statusText = buildStatusBarText(mode, modelName, cwd, percent, window, lastDuration, isStreaming)
-  gTui.setStatus(statusText)
-  gTui.renderTui()
-
-## Stream callback for CLI — writes each token immediately with flush
-proc cliStreamCallback(event: AgentEvent) =
-  case event.kind
-  of aekTextDelta:
-    if not gAssistantStarted:
-      if gThinkStarted:
-        gTui.addContentLine("")
-        gThinkStarted = false
-      gTui.addContentLine("Assistant: " & event.textDelta)
-      gAssistantStarted = true
-      if gStartTime == 0:
-        gStartTime = epochTime()
-    else:
-      # Append to last content line
-      if gTui.contentLines.len > 0:
-        gTui.contentLines[^1].add(event.textDelta)
-    gTui.renderTui()
-  of aekThinkDelta:
-    # Show thinking with think: prefix
-    if not gThinkStarted:
-      if gAssistantStarted:
-        gTui.addContentLine("")
-        gAssistantStarted = false
-      gTui.addContentLine("think: " & event.thinkDelta)
-      gThinkStarted = true
-      if gStartTime == 0:
-        gStartTime = epochTime()
-    else:
-      # Append to last content line
-      if gTui.contentLines.len > 0:
-        gTui.contentLines[^1].add(event.thinkDelta)
-    gTui.renderTui()
-  of aekToolCall:
-    gAssistantStarted = false
-    gThinkStarted = false
-    gTui.addContentLine("")
-    gTui.addContentLine(">> " & event.toolName & " " & $event.toolArgs)
-    gTui.addContentLine("")
-    gTui.renderTui()
-  of aekToolResult:
-    let preview = if event.resultText.len > 100: event.resultText[0 ..< 100] & "..." else: event.resultText
-    if event.resultIsError:
-      gTui.addContentLine("<< " & event.resultToolName & " error: " & preview)
-    else:
-      gTui.addContentLine("<< " & event.resultToolName & " " & preview)
-    gTui.addContentLine("")
-    gTui.renderTui()
-  of aekError:
-    gAssistantStarted = false
-    gThinkStarted = false
-    if gStartTime > 0:
-      gLastDuration = epochTime() - gStartTime
-      gStartTime = 0
-    gTui.addContentLine("Error: " & event.errorMsg)
-    gTui.addContentLine("")
-    gTui.renderTui()
-  of aekDone:
-    gAssistantStarted = false
-    gThinkStarted = false
-    if gStartTime > 0:
-      gLastDuration = epochTime() - gStartTime
-      gStartTime = 0
-    gTui.addContentLine("")
-    gTui.renderTui()
-
-## Check for keyboard input (non-blocking)
-proc checkKeyboard() =
-  ## Check for ESC key to interrupt
-  let ch = checkForKeyPress()
-  if ch == '\x1b':  # ESC key
-    gInterruptRequested = true
-    stderr.writeLine("\n" & yellow("[Interrupted by user]"))
-    stderr.flushFile()
-
 proc loadAndConnectMCP*(settings: Settings, registry: ToolRegistry, cwd: string): seq[MCPClient] =
   ## Load MCP config from global and project paths, connect servers, register tools
   result = @[]
@@ -321,7 +84,7 @@ proc loadAndConnectMCP*(settings: Settings, registry: ToolRegistry, cwd: string)
     let mcpConfig = loadMCPConfig(path)
     for srv in mcpConfig.servers:
       if srv.kind != "stdio" and srv.kind != "":
-        continue  # Only stdio transport for now
+        continue
       if srv.command == "":
         continue
       try:
@@ -352,7 +115,6 @@ proc loadAndConnectMCP*(settings: Settings, registry: ToolRegistry, cwd: string)
             parameters: toolInfo.inputSchema,
             workDir: cwd,
           )
-          # Store the MCP tool info for execution
           registry.mcpTools[uniqueName] = MCPTuple(client: client, toolName: toolInfo.name)
           registry.tools.add(mcpTool)
         
@@ -480,7 +242,6 @@ proc run(args: seq[string], opts: var OptParser) =
     let scheduler = newCronScheduler(store, nimcodeBin = binPath)
     scheduler.start()
     echo "Cron daemon started. Press Ctrl+C to stop."
-    # Keep running
     while true:
       sleep(1000)
     return
@@ -590,49 +351,60 @@ proc run(args: seq[string], opts: var OptParser) =
     ))
     agent.registry.webSearchProviderType = providerType
   
-  # Print mode: stream directly to stdout
+  # Print mode: stream directly to stdout (no TUI)
   if printMode:
     let userMsg = messages.join(" ")
     if userMsg == "":
       echo "Error: Message required in print mode"
       quit(1)
-    agent.processAgentTurnStream(userMsg, cliStreamCallback)
+    
+    let callbackState = newStreamCallbackState(scmPrint)
+    proc printCallback(event: AgentEvent) =
+      callbackState.printStreamCallback(event)
+    
+    agent.processAgentTurnStream(userMsg, printCallback)
     closeMCP(mcpClients)
     return
   
   # Interactive mode - initialize TUI
-  gTui = newTuiState()
+  let tui = newTuiState()
+  let statusBar = newStatusBarState(tui)
+  statusBar.agent = agent
+  statusBar.mode = mode
+  statusBar.modelName = modelName
+  statusBar.cwd = cwd
   
   # Add initial content
-  gTui.addContentLine("NimCode v" & VERSION)
-  gTui.addContentLine(formatMode(mode))
-  gTui.addContentLine("Provider: " & providerName)
-  gTui.addContentLine("Model: " & modelName)
+  tui.addContentLine("NimCode v" & VERSION)
+  tui.addContentLine(formatMode(mode))
+  tui.addContentLine("Provider: " & providerName)
+  tui.addContentLine("Model: " & modelName)
   if thinkingLevel != "":
-    gTui.addContentLine("Thinking: " & thinkingLevel)
-  gTui.addContentLine("Working directory: " & cwd)
-  gTui.addContentLine("")
+    tui.addContentLine("Thinking: " & thinkingLevel)
+  tui.addContentLine("Working directory: " & cwd)
+  tui.addContentLine("")
   
   if contextFilesInfo != "":
-    gTui.addContentLine(contextFilesInfo)
+    tui.addContentLine(contextFilesInfo)
   if sessionInfo != "":
-    gTui.addContentLine(sessionInfo)
+    tui.addContentLine(sessionInfo)
   
   # Initialize status bar
-  updateStatusBar(agent, mode, modelName, cwd, 0, false)
-  gTui.renderTui()
+  statusBar.updateStatusBar()
+  
+  # Create TUI stream callback
+  let callbackState = newStreamCallbackState(scmTui, tui, statusBar)
+  proc tuiCallback(event: AgentEvent) =
+    callbackState.tuiStreamCallback(event)
   
   # Process initial message with streaming
   if messages.len > 0:
     let userMsg = messages.join(" ")
     gInterruptRequested = false
-    gStartTime = epochTime()
-    gIsStreaming = true
-    updateStatusBar(agent, mode, modelName, cwd, 0, true)
-    agent.processAgentTurnStream(userMsg, cliStreamCallback)
-    gIsStreaming = false
-    gLastDuration = epochTime() - gStartTime
-    updateStatusBar(agent, mode, modelName, cwd, gLastDuration, false)
+    statusBar.startTimer()
+    agent.processAgentTurnStream(userMsg, tuiCallback)
+    statusBar.stopTimer()
+    statusBar.updateStatusBar()
   
   # Interactive loop
   while true:
@@ -640,7 +412,7 @@ proc run(args: seq[string], opts: var OptParser) =
     gInterruptRequested = false
     
     # Update status bar
-    updateStatusBar(agent, mode, modelName, cwd, gLastDuration, false)
+    statusBar.updateStatusBar()
     
     # Read input with Tab handling
     let (input, tabPressed) = readLineWithTab()
@@ -652,130 +424,137 @@ proc run(args: seq[string], opts: var OptParser) =
       of "agent": mode = "yolo"
       of "yolo": mode = "plan"
       else: mode = "agent"
-      gTui.addContentLine("Mode: " & mode)
-      updateStatusBar(agent, mode, modelName, cwd, gLastDuration, false)
-      gTui.renderTui()
+      statusBar.mode = mode
+      tui.addContentLine("Mode: " & mode)
+      statusBar.updateStatusBar()
       continue
     
     if input.strip() == "":
       continue
     
     # Add user input to content
-    gTui.addContentLine("> " & input)
-    gTui.clearInput()
-    gTui.renderTui()
+    tui.addContentLine("> " & input)
+    tui.clearInput()
+    tui.renderTui()
     
     let cmd = input.strip
     if cmd == "exit" or cmd == "quit":
       break
     elif cmd == "clear":
       agent.clearMessages()
-      gTui.clearContent()
-      gTui.addContentLine("Conversation cleared")
-      gTui.renderTui()
+      tui.clearContent()
+      tui.addContentLine("Conversation cleared")
+      tui.renderTui()
       continue
     elif cmd == "help":
-      gTui.addContentLine("Commands:")
-      gTui.addContentLine("  clear    - Clear conversation history")
-      gTui.addContentLine("  exit     - Exit NimCode")
-      gTui.addContentLine("  help     - Show this help")
-      gTui.addContentLine("  mode     - Show current mode")
-      gTui.addContentLine("  mode <m> - Set mode (plan, agent, yolo)")
-      gTui.addContentLine("  provider - Show current provider")
-      gTui.addContentLine("  model    - Show current model")
-      gTui.addContentLine("  thinking - Show thinking level")
-      gTui.addContentLine("  session  - Show session info")
-      gTui.addContentLine("  sessions - List recent sessions")
-      gTui.addContentLine("  usage    - Show context usage")
-      gTui.addContentLine("  mcp      - Show MCP server status")
-      gTui.addContentLine("  sandbox  - Show sandbox status")
-      gTui.addContentLine("  cron     - List cron jobs")
-      gTui.addContentLine("  tools    - List available tools")
-      gTui.addContentLine("")
-      gTui.addContentLine("Keyboard shortcuts:")
-      gTui.addContentLine("  ESC      - Interrupt running agent")
-      gTui.addContentLine("  Ctrl+C   - Exit NimCode")
-      gTui.renderTui()
+      tui.addContentLine("Commands:")
+      tui.addContentLine("  clear    - Clear conversation history")
+      tui.addContentLine("  exit     - Exit NimCode")
+      tui.addContentLine("  help     - Show this help")
+      tui.addContentLine("  mode     - Show current mode")
+      tui.addContentLine("  mode <m> - Set mode (plan, agent, yolo)")
+      tui.addContentLine("  provider - Show current provider")
+      tui.addContentLine("  model    - Show current model")
+      tui.addContentLine("  thinking - Show thinking level")
+      tui.addContentLine("  session  - Show session info")
+      tui.addContentLine("  sessions - List recent sessions")
+      tui.addContentLine("  usage    - Show context usage")
+      tui.addContentLine("  mcp      - Show MCP server status")
+      tui.addContentLine("  sandbox  - Show sandbox status")
+      tui.addContentLine("  cron     - List cron jobs")
+      tui.addContentLine("  tools    - List available tools")
+      tui.addContentLine("")
+      tui.addContentLine("Keyboard shortcuts:")
+      tui.addContentLine("  Tab      - Cycle through modes")
+      tui.addContentLine("  ESC      - Interrupt running agent")
+      tui.addContentLine("  Ctrl+C   - Exit NimCode")
+      tui.renderTui()
       continue
     elif cmd == "mode":
-      gTui.addContentLine("Mode: " & mode)
-      gTui.addContentLine("Use 'mode <name>' to change (plan, agent, yolo)")
-      gTui.renderTui()
+      tui.addContentLine("Mode: " & mode)
+      tui.addContentLine("Use 'mode <name>' to change (plan, agent, yolo)")
+      tui.renderTui()
       continue
     elif cmd == "mode plan" or cmd == "mode agent" or cmd == "mode yolo":
       mode = cmd.split(" ")[1]
-      gTui.addContentLine("Mode changed to: " & mode)
-      updateStatusBar(agent, mode, modelName, cwd, gLastDuration, false)
-      gTui.renderTui()
+      statusBar.mode = mode
+      tui.addContentLine("Mode changed to: " & mode)
+      statusBar.updateStatusBar()
       continue
     elif cmd == "provider":
-      echo "Provider: " & providerName
+      tui.addContentLine("Provider: " & providerName)
+      tui.renderTui()
       continue
     elif cmd == "model":
-      echo "Model: " & modelName
+      tui.addContentLine("Model: " & modelName)
+      tui.renderTui()
       continue
     elif cmd == "thinking":
-      echo "Thinking: " & thinkingLevel
+      tui.addContentLine("Thinking: " & thinkingLevel)
+      tui.renderTui()
       continue
     elif cmd == "session":
-      echo sess.getSessionInfo()
+      tui.addContentLine(sess.getSessionInfo())
+      tui.renderTui()
       continue
     elif cmd == "sessions":
       let sessions = listSessionsForDir(cwd)
       if sessions.len == 0:
-        echo "No sessions found"
+        tui.addContentLine("No sessions found")
       else:
-        echo "Recent sessions:"
+        tui.addContentLine("Recent sessions:")
         for s in sessions:
           if sessions.find(s) >= 10: break
-          echo "  " & s.id & "  " & s.name
+          tui.addContentLine("  " & s.id & "  " & s.name)
+      tui.renderTui()
       continue
     elif cmd == "usage":
       let usage = agent.getContextUsage()
-      gTui.addContentLine("Context: " & $usage.tokens & " tokens")
+      tui.addContentLine("Context: " & $usage.tokens & " tokens")
       if usage.contextWindow > 0:
-        gTui.addContentLine("Window: " & $usage.contextWindow & " tokens")
+        tui.addContentLine("Window: " & $usage.contextWindow & " tokens")
       if usage.percent.isSome:
-        gTui.addContentLine("Usage: " & formatFloat(usage.percent.get, ffDecimal, 1) & "%")
-      gTui.renderTui()
+        tui.addContentLine("Usage: " & formatFloat(usage.percent.get, ffDecimal, 1) & "%")
+      tui.renderTui()
       continue
     elif cmd == "mcp":
       if mcpClients.len == 0:
-        gTui.addContentLine("No MCP servers connected")
+        tui.addContentLine("No MCP servers connected")
       else:
-        gTui.addContentLine("MCP servers:")
+        tui.addContentLine("MCP servers:")
         for client in mcpClients:
           let status = if client.isConnected(): "connected" else: "disconnected"
-          gTui.addContentLine("  " & client.name & " (" & status & ")")
-      gTui.renderTui()
+          tui.addContentLine("  " & client.name & " (" & status & ")")
+      tui.renderTui()
       continue
     elif cmd == "sandbox":
       if agent.registry.sandbox == nil:
-        gTui.addContentLine("Sandbox: disabled")
+        tui.addContentLine("Sandbox: disabled")
       else:
-        gTui.addContentLine("Sandbox: enabled (level: " & $agent.registry.sandboxLevel & ")")
-        gTui.addContentLine("  bwrap: " & (if agent.registry.sandbox.isAvailable(): "available" else: "not available"))
-      gTui.renderTui()
+        tui.addContentLine("Sandbox: enabled (level: " & $agent.registry.sandboxLevel & ")")
+        tui.addContentLine("  bwrap: " & (if agent.registry.sandbox.isAvailable(): "available" else: "not available"))
+      tui.renderTui()
       continue
     elif cmd == "cron":
-      gTui.addContentLine(agent.registry.cronStore.formatJobs())
-      gTui.renderTui()
+      tui.addContentLine(agent.registry.cronStore.formatJobs())
+      tui.renderTui()
       continue
     elif cmd == "tools":
-      gTui.addContentLine("Available tools:")
+      tui.addContentLine("Available tools:")
       for t in agent.registry.tools:
-        gTui.addContentLine("  " & t.name & " - " & t.description[0 ..< min(t.description.len, 60)])
-      gTui.renderTui()
+        tui.addContentLine("  " & t.name & " - " & t.description[0 ..< min(t.description.len, 60)])
+      tui.renderTui()
       continue
     elif cmd.startsWith("mode "):
       let newMode = cmd[5 .. ^1].strip
       if newMode in ["plan", "agent", "yolo"]:
         mode = newMode
-        gTui.addContentLine("Mode changed to: " & mode)
-        updateStatusBar(agent, mode, modelName, cwd, gLastDuration, false)
+        statusBar.mode = mode
+        tui.addContentLine("Mode changed to: " & mode)
+        statusBar.updateStatusBar()
       else:
-        gTui.addContentLine("Invalid mode: " & newMode)
-      gTui.renderTui()
+        tui.addContentLine("Invalid mode: " & newMode)
+      tui.renderTui()
       continue
     elif cmd.startsWith("/"):
       # Slash commands
@@ -784,71 +563,88 @@ proc run(args: seq[string], opts: var OptParser) =
       case slashCmd
       of "/clear":
         agent.clearMessages()
-        gTui.addContentLine "Conversation cleared"
+        tui.clearContent()
+        tui.addContentLine("Conversation cleared")
+        tui.renderTui()
       of "/mode":
         if parts.len > 1:
           let newMode = parts[1].strip
           if newMode in ["plan", "agent", "yolo"]:
             mode = newMode
-            gTui.addContentLine "Mode changed to: " & mode
+            statusBar.mode = mode
+            tui.addContentLine("Mode changed to: " & mode)
+            statusBar.updateStatusBar()
           else:
-            gTui.addContentLine "Invalid mode: " & newMode
+            tui.addContentLine("Invalid mode: " & newMode)
         else:
-          gTui.addContentLine "Current mode: " & mode
+          tui.addContentLine("Current mode: " & mode)
+        tui.renderTui()
       of "/compact":
         let summary = agent.compactContext()
         if summary != "":
-          gTui.addContentLine "Context compacted (" & $summary.len & " chars summary)"
+          tui.addContentLine("Context compacted (" & $summary.len & " chars summary)")
         else:
-          gTui.addContentLine "No compaction needed"
+          tui.addContentLine("No compaction needed")
+        tui.renderTui()
       of "/model":
         if parts.len > 1:
           modelName = parts[1].strip
-          gTui.addContentLine "Model changed to: " & modelName
+          statusBar.modelName = modelName
+          tui.addContentLine("Model changed to: " & modelName)
+          statusBar.updateStatusBar()
         else:
-          gTui.addContentLine "Current model: " & modelName
+          tui.addContentLine("Current model: " & modelName)
+        tui.renderTui()
       of "/provider":
         if parts.len > 1:
           providerName = parts[1].strip
-          gTui.addContentLine "Provider changed to: " & providerName
+          tui.addContentLine("Provider changed to: " & providerName)
+          statusBar.updateStatusBar()
         else:
-          gTui.addContentLine "Current provider: " & providerName
+          tui.addContentLine("Current provider: " & providerName)
+        tui.renderTui()
       of "/thinking":
         if parts.len > 1:
           thinkingLevel = parts[1].strip
-          gTui.addContentLine "Thinking level changed to: " & thinkingLevel
+          tui.addContentLine("Thinking level changed to: " & thinkingLevel)
         else:
-          gTui.addContentLine "Current thinking level: " & thinkingLevel
+          tui.addContentLine("Current thinking level: " & thinkingLevel)
+        tui.renderTui()
       of "/help":
-        gTui.addContentLine "Slash commands:"
-        gTui.addContentLine "  /clear       - Clear conversation history"
-        gTui.addContentLine "  /mode [mode] - Show or change mode (plan, agent, yolo)"
-        gTui.addContentLine "  /cycle       - Cycle through modes (plan -> agent -> yolo -> plan)"
-        gTui.addContentLine "  /compact     - Compact context (summarize old messages)"
-        gTui.addContentLine "  /model [id]  - Show or change model"
-        gTui.addContentLine "  /provider [name] - Show or change provider"
-        gTui.addContentLine "  /thinking [level] - Show or change thinking level"
-        gTui.addContentLine "  /help        - Show this help"
+        tui.addContentLine("Slash commands:")
+        tui.addContentLine("  /clear       - Clear conversation history")
+        tui.addContentLine("  /mode [mode] - Show or change mode (plan, agent, yolo)")
+        tui.addContentLine("  /cycle       - Cycle through modes (plan -> agent -> yolo -> plan)")
+        tui.addContentLine("  /compact     - Compact context (summarize old messages)")
+        tui.addContentLine("  /model [id]  - Show or change model")
+        tui.addContentLine("  /provider [name] - Show or change provider")
+        tui.addContentLine("  /thinking [level] - Show or change thinking level")
+        tui.addContentLine("  /help        - Show this help")
+        tui.renderTui()
       of "/cycle":
         case mode
-        of "plan":
-          mode = "agent"
-        of "agent":
-          mode = "yolo"
-        of "yolo":
-          mode = "plan"
-        else:
-          mode = "agent"
-        gTui.addContentLine "Mode changed to: " & mode
+        of "plan": mode = "agent"
+        of "agent": mode = "yolo"
+        of "yolo": mode = "plan"
+        else: mode = "agent"
+        statusBar.mode = mode
+        tui.addContentLine("Mode changed to: " & mode)
+        statusBar.updateStatusBar()
+        tui.renderTui()
       else:
-        gTui.addContentLine "Unknown command: " & slashCmd
-        gTui.addContentLine "Type '/help' for available slash commands"
+        tui.addContentLine("Unknown command: " & slashCmd)
+        tui.addContentLine("Type '/help' for available slash commands")
+        tui.renderTui()
       continue
     
     # Process with real-time streaming
-    agent.processAgentTurnStream(input, cliStreamCallback)
+    statusBar.startTimer()
+    agent.processAgentTurnStream(input, tuiCallback)
+    statusBar.stopTimer()
+    statusBar.updateStatusBar()
   
   # Cleanup
+  disableRawMode()
   closeMCP(mcpClients)
 
 when isMainModule:
@@ -856,5 +652,6 @@ when isMainModule:
     var p = initOptParser()
     run(@[], p)
   except CatchableError as e:
+    disableRawMode()
     stderr.writeLine("Error: " & e.msg)
     quit(1)

@@ -7,6 +7,12 @@ nimblecache/
 # Binary
 bin/nimcode
 
+# Test executables
+tests/test_tui
+tests/test_statusbar
+tests/test_stream
+tests/test_input
+
 # IDE
 .idea/
 .vscode/
