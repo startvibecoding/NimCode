@@ -1,6 +1,8 @@
-import std/[json, os, osproc, strutils, options, algorithm, sequtils, times, streams, base64]
+import std/[json, os, osproc, strutils, options, algorithm, sequtils, times, streams, base64, tables]
 import ../provider/types
 import ../cron/cron as cronModule
+import ../mcp/mcp as mcpModule
+import ../sandbox/sandbox as sandboxModule
 import ./jobs as jobsModule
 
 # Plan Step
@@ -349,7 +351,7 @@ proc bashToolParams(): JsonNode =
     "required": ["command"]
   }
 
-proc executeBash(tool: Tool, params: JsonNode): ToolResult =
+proc executeBash(tool: Tool, params: JsonNode, sandbox: sandboxModule.Sandbox = nil): ToolResult =
   let command = params{"command"}.getStr("")
   if command == "":
     return newToolResult("command is required", true)
@@ -367,7 +369,29 @@ proc executeBash(tool: Tool, params: JsonNode): ToolResult =
       return newToolResult("Error starting background command: " & e.msg, true)
   
   try:
-    let (output, exitCode) = execCmdEx(command, options = {}, workingDir = tool.workDir)
+    var output: string
+    var exitCode: int
+    
+    # Use sandbox if available and enabled
+    if sandbox != nil and sandbox.isAvailable():
+      let shell = getEnv("SHELL", "/bin/sh")
+      let wrappedCmd = sandbox.wrapCommand(shell, command, timeout)
+      if wrappedCmd.len > 0:
+        let process = startProcess(
+          wrappedCmd[0],
+          args = wrappedCmd[1 .. ^1],
+          options = {poStdErrToStdOut},
+          workingDir = tool.workDir
+        )
+        output = process.outputStream().readAll()
+        exitCode = process.waitForExit()
+        process.close()
+      else:
+        # Fallback to normal execution
+        (output, exitCode) = execCmdEx(command, options = {}, workingDir = tool.workDir)
+    else:
+      (output, exitCode) = execCmdEx(command, options = {}, workingDir = tool.workDir)
+    
     var result = "[command]\n" & command & "\n[cwd]\n" & tool.workDir & "\n[stdout]\n" & output & "\n[exit_code]\n" & $exitCode
     
     if result.len > 50000:
@@ -533,6 +557,18 @@ proc skillRefToolParams(): JsonNode =
     "required": ["skill", "ref"]
   }
 
+# Spawn Tool (multi-agent)
+proc spawnToolParams(): JsonNode =
+  %*{
+    "type": "object",
+    "properties": {
+      "prompt": {"type": "string", "description": "Task description for the sub-agent"},
+      "mode": {"type": "string", "description": "Sub-agent mode: agent, yolo (default: yolo)", "enum": ["agent", "yolo"]},
+      "working_directory": {"type": "string", "description": "Working directory for the sub-agent (default: current directory)"}
+    },
+    "required": ["prompt"]
+  }
+
 # Cron Tool
 proc cronToolParams(): JsonNode =
   %*{
@@ -581,16 +617,61 @@ proc executeCron(tool: Tool, params: JsonNode, cronStore: cronModule.CronStore):
   except CatchableError as e:
     return newToolResult("Cron error: " & e.msg, true)
 
+# Spawn Tool (multi-agent)
+proc executeSpawn(tool: Tool, params: JsonNode): ToolResult =
+  let prompt = params{"prompt"}.getStr("")
+  if prompt == "":
+    return newToolResult("prompt is required", true)
+  
+  let subMode = params{"mode"}.getStr("yolo")
+  let subWorkDir = params{"working_directory"}.getStr(tool.workDir)
+  
+  # Execute sub-agent via nimcode CLI
+  let args = @["-M", subMode, "-P", prompt]
+  try:
+    let (output, exitCode) = execCmdEx("nimcode " & args.mapIt("'" & it & "'").join(" "))
+    if exitCode == 0:
+      return newToolResult(output.strip())
+    else:
+      return newToolResult("Sub-agent failed (exit " & $exitCode & "): " & output.strip(), true)
+  except CatchableError as e:
+    return newToolResult("Spawn error: " & e.msg, true)
+
 # Tool Registry
 type
+# MCP tool info for execution
+  MCPTuple* = object
+    client*: mcpModule.MCPClient
+    toolName*: string
+
   ToolRegistry* = ref object
     tools*: seq[Tool]
     skillsDir*: string  ## Global skills directory for skill_ref
     cronStore*: cronModule.CronStore  ## Cron job store
+    mcpTools*: Table[string, MCPTuple]  ## MCP tool name -> client+toolName
+    webSearchProviderType*: string  ## Provider type for web_search hosted tool
+    sandbox*: sandboxModule.Sandbox  ## Sandbox for bash execution
+    sandboxLevel*: sandboxModule.SandboxLevel
 
-proc newToolRegistry*(workDir: string, skillsDir: string = ""): ToolRegistry =
-  let cronPath = getConfigDir() / ".nimcode" / "cron.json"
-  result = ToolRegistry(tools: @[], skillsDir: skillsDir, cronStore: cronModule.newCronStore(cronPath))
+proc newToolRegistry*(workDir: string, skillsDir: string = "", sandboxEnabled: bool = false, sandboxLevel: string = "none"): ToolRegistry =
+  let cronPath = getHomeDir() / ".nimcode" / "cron.json"
+  let sbLevel = case sandboxLevel
+    of "strict": sandboxModule.slStrict
+    of "standard": sandboxModule.slStandard
+    else: sandboxModule.slNone
+  let sb = if sandboxEnabled and sbLevel != sandboxModule.slNone:
+    sandboxModule.newSandbox(workDir, sbLevel)
+  else:
+    nil
+  result = ToolRegistry(
+    tools: @[],
+    skillsDir: skillsDir,
+    cronStore: cronModule.newCronStore(cronPath),
+    mcpTools: initTable[string, MCPTuple](),
+    webSearchProviderType: "",
+    sandbox: sb,
+    sandboxLevel: sbLevel
+  )
   
   result.tools.add(Tool(name: "read", description: "Read file contents (supports text and images)", parameters: readToolParams(), workDir: workDir))
   result.tools.add(Tool(name: "write", description: "Write content to a file", parameters: writeToolParams(), workDir: workDir))
@@ -603,6 +684,7 @@ proc newToolRegistry*(workDir: string, skillsDir: string = ""): ToolRegistry =
   result.tools.add(Tool(name: "jobs", description: "List background jobs", parameters: listJobsToolParams(), workDir: workDir))
   result.tools.add(Tool(name: "kill", description: "Kill a running background job", parameters: killToolParams(), workDir: workDir))
   result.tools.add(Tool(name: "cron", description: "Manage scheduled tasks (cron jobs). Create one-time or periodic background tasks.", parameters: cronToolParams(), workDir: workDir))
+  result.tools.add(Tool(name: "spawn", description: "Spawn a sub-agent to handle a task in parallel. The sub-agent runs independently and returns results.", parameters: spawnToolParams(), workDir: workDir))
   result.tools.add(Tool(name: "skill_ref", description: "Load a reference file from an active skill. Use this to access on-demand knowledge from skills that have reference files.", parameters: skillRefToolParams(), workDir: workDir))
 
 proc getTool*(registry: ToolRegistry, name: string): Option[Tool] =
@@ -630,7 +712,7 @@ proc execute*(registry: ToolRegistry, toolName: string, params: JsonNode): ToolR
   of "read": return tool.executeRead(params)
   of "write": return tool.executeWrite(params)
   of "edit": return tool.executeEdit(params)
-  of "bash": return tool.executeBash(params)
+  of "bash": return tool.executeBash(params, registry.sandbox)
   of "ls": return tool.executeLs(params)
   of "grep": return tool.executeGrep(params)
   of "find": return tool.executeFind(params)
@@ -638,6 +720,7 @@ proc execute*(registry: ToolRegistry, toolName: string, params: JsonNode): ToolR
   of "jobs": return tool.executeJobs(params)
   of "kill": return tool.executeKill(params)
   of "cron": return tool.executeCron(params, registry.cronStore)
+  of "spawn": return tool.executeSpawn(params)
   of "skill_ref":
     # Skill ref: load reference file from skills directory
     let skillName = params{"skill"}.getStr("")
@@ -653,4 +736,13 @@ proc execute*(registry: ToolRegistry, toolName: string, params: JsonNode): ToolR
       return newToolResult(readFile(fullPath))
     except CatchableError as e:
       return newToolResult("Error reading reference: " & e.msg, true)
-  else: return newToolResult("Unknown tool: " & toolName, true)
+  else:
+    # Check if it's an MCP tool
+    if registry.mcpTools.hasKey(toolName):
+      let mcpTuple = registry.mcpTools[toolName]
+      try:
+        let result = mcpModule.callTool(mcpTuple.client, mcpTuple.toolName, params)
+        return newToolResult(result)
+      except CatchableError as e:
+        return newToolResult("MCP tool error: " & e.msg, true)
+    return newToolResult("Unknown tool: " & toolName, true)

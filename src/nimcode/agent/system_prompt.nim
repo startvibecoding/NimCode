@@ -80,6 +80,33 @@ proc buildSystemPrompt*(mode: string, toolNames: seq[string], cwd: string, extra
   result.add("- Be concise in your responses\n")
   result.add("- Show file paths clearly when working with files\n")
   
+  # Tool-specific guidelines
+  if "web_search" in toolNames:
+    result.add("\n## Web Search\n")
+    result.add("- Use web_search to find current information when your knowledge may be outdated\n")
+    result.add("- Use web_search for questions about recent events, APIs, or technologies\n")
+    result.add("- Summarize search results concisely\n")
+  
+  if "cron" in toolNames:
+    result.add("\n## Cron/Scheduled Tasks\n")
+    result.add("- The `cron` tool manages scheduled background tasks\n")
+    result.add("- Use `cron(action=\"list\")` to see existing tasks\n")
+    result.add("- Use `cron(action=\"create\", name=\"...\", prompt=\"...\", schedule=\"@daily\")` for periodic tasks\n")
+    result.add("- Use `cron(action=\"create\", name=\"...\", prompt=\"...\", oneshot=true)` for one-time tasks\n")
+    result.add("- Schedule formats: @daily, @weekly, @monthly, @hourly, @every 30m, @every 2h\n")
+  
+  # Check for MCP tools
+  var hasMCP = false
+  for name in toolNames:
+    if name.startsWith("mcp_"):
+      hasMCP = true
+      break
+  if hasMCP:
+    result.add("\n## MCP Tools\n")
+    result.add("- MCP (Model Context Protocol) tools are provided by external servers\n")
+    result.add("- MCP tool names follow the pattern: mcp_{server}_{tool}\n")
+    result.add("- Use MCP tools like any other tool when appropriate\n")
+  
   # Append extra context from files and skills
   if extraContext != "":
     result.add("\n## Context from project files\n")

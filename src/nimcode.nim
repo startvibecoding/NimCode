@@ -1,9 +1,7 @@
-import std/[os, strutils, parseopt, options]
+import std/[os, strutils, parseopt, options, json, tables, sequtils]
 import nimcode/config/config
 import nimcode/provider/types
-import nimcode/provider/openai
-import nimcode/provider/anthropic
-import nimcode/provider/google
+import nimcode/provider/factory
 import nimcode/tools/tools
 import nimcode/session/session
 import nimcode/agent/agent
@@ -12,6 +10,9 @@ import nimcode/skills/skills
 import nimcode/memory/memory
 import nimcode/tui/format
 import nimcode/gateway/gateway
+import nimcode/mcp/mcp as mcpModule
+import nimcode/sandbox/sandbox as sandboxModule
+import nimcode/cron/cron as cronModule
 
 const VERSION = "0.1.1"
 
@@ -64,7 +65,6 @@ proc cliStreamCallback(event: AgentEvent) =
     stdout.write(event.textDelta)
     stdout.flushFile()
   of aekThinkDelta:
-    # Show thinking in a dim style
     stderr.write(event.thinkDelta)
     stderr.flushFile()
   of aekToolCall:
@@ -80,6 +80,64 @@ proc cliStreamCallback(event: AgentEvent) =
   of aekDone:
     stdout.write("\n")
     stdout.flushFile()
+
+proc loadAndConnectMCP*(settings: Settings, registry: ToolRegistry, cwd: string): seq[MCPClient] =
+  ## Load MCP config from global and project paths, connect servers, register tools
+  result = @[]
+  let paths = @[globalMCPPath(), cwd / projectMCPPath()]
+  
+  for path in paths:
+    if not fileExists(path):
+      continue
+    let mcpConfig = loadMCPConfig(path)
+    for srv in mcpConfig.servers:
+      if srv.kind != "stdio" and srv.kind != "":
+        continue  # Only stdio transport for now
+      if srv.command == "":
+        continue
+      try:
+        let envPairs = srv.env.mapIt((it.name, it.value))
+        let client = newMCPClient(srv.name, srv.command, srv.args, envPairs)
+        result.add(client)
+        
+        # Register MCP tools
+        let tools = client.listTools()
+        var registeredNames = initTable[string, bool]()
+        for t in registry.tools:
+          registeredNames[t.name] = true
+        
+        for toolInfo in tools:
+          if toolInfo.name == "":
+            continue
+          let baseName = "mcp_" & srv.name & "_" & toolInfo.name
+          var uniqueName = baseName
+          var counter = 1
+          while registeredNames.hasKey(uniqueName):
+            uniqueName = baseName & "_" & $counter
+            counter += 1
+          
+          registeredNames[uniqueName] = true
+          let mcpTool = Tool(
+            name: uniqueName,
+            description: if toolInfo.description != "": toolInfo.description else: "MCP tool from " & srv.name,
+            parameters: toolInfo.inputSchema,
+            workDir: cwd,
+          )
+          # Store the MCP tool info for execution
+          registry.mcpTools[uniqueName] = MCPTuple(client: client, toolName: toolInfo.name)
+          registry.tools.add(mcpTool)
+        
+        if tools.len > 0:
+          stderr.writeLine("MCP: Connected " & srv.name & " (" & $tools.len & " tools)")
+      except CatchableError as e:
+        stderr.writeLine("MCP: Failed to connect " & srv.name & ": " & e.msg)
+
+proc closeMCP*(clients: seq[MCPClient]) =
+  for client in clients:
+    try:
+      client.close()
+    except:
+      discard
 
 proc run(args: seq[string], opts: var OptParser) =
   var providerName = ""
@@ -172,35 +230,14 @@ proc run(args: seq[string], opts: var OptParser) =
   if thinkingLevel == "":
     thinkingLevel = settings.defaultThinkingLevel
   
-  # Get provider config
-  let providerConfig = resolveProviderConfig(settings, providerName)
-  let apiKey = resolveKey(providerConfig)
-  if apiKey == "":
-    echo "Error: API key not set for provider: " & providerName
+  # Create provider using factory
+  var provider: Provider
+  try:
+    provider = createProviderFromSettings(settings, providerName)
+  except CatchableError as e:
+    echo "Error: " & e.msg
     echo "Set the environment variable or configure in ~/.nimcode/settings.json"
     quit(1)
-  
-  # Create provider based on API type
-  var provider: Provider
-  if providerConfig.api == "anthropic-messages":
-    provider = newAnthropicProvider(apiKey, providerConfig.baseUrl,
-      retryEnabled = settings.retry.enabled,
-      maxRetries = settings.retry.maxRetries,
-      baseDelayMs = settings.retry.baseDelayMs)
-  elif providerConfig.api == "google-gemini":
-    provider = newGoogleGeminiProvider(apiKey, providerConfig.baseUrl,
-      retryEnabled = settings.retry.enabled,
-      maxRetries = settings.retry.maxRetries,
-      baseDelayMs = settings.retry.baseDelayMs)
-  else:
-    let openaiProv = newOpenAiProvider(apiKey, providerConfig.baseUrl,
-      retryEnabled = settings.retry.enabled,
-      maxRetries = settings.retry.maxRetries,
-      baseDelayMs = settings.retry.baseDelayMs)
-    # Enable Responses API for openai-responses type
-    if providerConfig.api == "openai-responses":
-      openaiProv.useResponsesApi = true
-    provider = openaiProv
   
   let cwd = getCurrentDir()
   
@@ -211,9 +248,9 @@ proc run(args: seq[string], opts: var OptParser) =
   let contextFilesInfo = buildContextFilesInfo(cfResult)
   
   # Load skills
-  let skillsDir = globalConfigDir / "skills"
+  let skillsPath = if settings.skillsDir != "": settings.skillsDir else: globalConfigDir / "skills"
   let projectSkillsDir = cwd / ".skills"
-  let skillsMgr = newManager(skillsDir, projectSkillsDir)
+  let skillsMgr = newManager(skillsPath, projectSkillsDir)
   skillsMgr.load()
   let skillsContext = skillsMgr.buildAllSkillsContext()
   
@@ -225,6 +262,7 @@ proc run(args: seq[string], opts: var OptParser) =
   let extraContext = contextStr & skillsContext & memoryContext
   
   # Setup session
+  let sessionPath = if settings.sessionDir != "": settings.sessionDir else: ""
   var sess: Session
   var sessionInfo = ""
   if continueSession:
@@ -247,8 +285,30 @@ proc run(args: seq[string], opts: var OptParser) =
     provider, modelName, mode, cwd, sess,
     extraContext = extraContext,
     settings = settings,
-    thinkingLevel = parsedThinkingLevel
+    thinkingLevel = parsedThinkingLevel,
+    sandboxEnabled = settings.sandbox.enabled,
+    sandboxLevel = settings.sandbox.level
   )
+  
+  # Load and connect MCP servers
+  let mcpClients = loadAndConnectMCP(settings, agent.registry, cwd)
+  
+  # Add web-search hosted tool if enabled
+  if settings.webSearch.enabled:
+    let providerType = if settings.webSearch.providerType != "": settings.webSearch.providerType else: "responses"
+    agent.registry.tools.add(Tool(
+      name: "web_search",
+      description: "Search the web for information. Returns relevant search results.",
+      parameters: %*{
+        "type": "object",
+        "properties": {
+          "query": {"type": "string", "description": "Search query"}
+        },
+        "required": ["query"]
+      },
+      workDir: cwd,
+    ))
+    agent.registry.webSearchProviderType = providerType
   
   # Print mode: stream directly to stdout
   if printMode:
@@ -257,6 +317,7 @@ proc run(args: seq[string], opts: var OptParser) =
       echo "Error: Message required in print mode"
       quit(1)
     agent.processAgentTurnStream(userMsg, cliStreamCallback)
+    closeMCP(mcpClients)
     return
   
   # Interactive mode
@@ -307,6 +368,10 @@ proc run(args: seq[string], opts: var OptParser) =
       echo "  session  - Show session info"
       echo "  sessions - List recent sessions"
       echo "  usage    - Show context usage"
+      echo "  mcp      - Show MCP server status"
+      echo "  sandbox  - Show sandbox status"
+      echo "  cron     - List cron jobs"
+      echo "  tools    - List available tools"
       continue
     elif cmd == "mode":
       echo "Mode: " & mode
@@ -341,6 +406,30 @@ proc run(args: seq[string], opts: var OptParser) =
       if usage.percent.isSome:
         echo "Usage: " & formatFloat(usage.percent.get, ffDecimal, 1) & "%"
       continue
+    elif cmd == "mcp":
+      if mcpClients.len == 0:
+        echo "No MCP servers connected"
+      else:
+        echo "MCP servers:"
+        for client in mcpClients:
+          let status = if client.isConnected(): "connected" else: "disconnected"
+          echo "  " & client.name & " (" & status & ")"
+      continue
+    elif cmd == "sandbox":
+      if agent.registry.sandbox == nil:
+        echo "Sandbox: disabled"
+      else:
+        echo "Sandbox: enabled (level: " & $agent.registry.sandboxLevel & ")"
+        echo "  bwrap: " & (if agent.registry.sandbox.isAvailable(): "available" else: "not available")
+      continue
+    elif cmd == "cron":
+      echo agent.registry.cronStore.formatJobs()
+      continue
+    elif cmd == "tools":
+      echo "Available tools:"
+      for t in agent.registry.tools:
+        echo "  " & t.name & " - " & t.description[0 ..< min(t.description.len, 60)]
+      continue
     elif cmd.startsWith("mode "):
       let newMode = cmd[5 .. ^1].strip
       if newMode in ["plan", "agent", "yolo"]:
@@ -356,6 +445,9 @@ proc run(args: seq[string], opts: var OptParser) =
     
     # Process with real-time streaming
     agent.processAgentTurnStream(input, cliStreamCallback)
+  
+  # Cleanup
+  closeMCP(mcpClients)
 
 when isMainModule:
   try:

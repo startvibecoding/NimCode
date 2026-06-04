@@ -35,7 +35,9 @@ proc newAgent*(
   extraContext: string = "",
   contextWindow: int = 128000,
   settings: Settings = nil,
-  thinkingLevel: ThinkingLevel = tlOff
+  thinkingLevel: ThinkingLevel = tlOff,
+  sandboxEnabled: bool = false,
+  sandboxLevel: string = "none"
 ): Agent =
   var compaction = defaultCompactionSettings()
   if settings != nil:
@@ -45,7 +47,7 @@ proc newAgent*(
     modelId: modelId,
     mode: mode,
     workDir: workDir,
-    registry: newToolRegistry(workDir),
+    registry: newToolRegistry(workDir, sandboxEnabled = sandboxEnabled, sandboxLevel = sandboxLevel),
     session: session,
     messages: @[],
     maxTokens: maxTokens,

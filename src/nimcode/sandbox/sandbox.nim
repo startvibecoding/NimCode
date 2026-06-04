@@ -99,14 +99,7 @@ proc execute*(s: Sandbox, shell, cmd: string, timeout: int = 120): tuple[output:
     return ("Failed to build sandbox command", 1)
   
   try:
-    let process = startProcess(
-      fullCmd[0],
-      args = fullCmd[1 .. ^1],
-      options = {poStdErrToStdOut, poUsePath}
-    )
-    let output = process.outputStream().readAll()
-    let exitCode = process.waitForExit()
-    process.close()
+    let (output, exitCode) = execCmdEx(fullCmd.join(" "), options = {poStdErrToStdOut})
     return (output, exitCode)
   except CatchableError as e:
     return ("Sandbox execution error: " & e.msg, 1)

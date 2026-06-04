@@ -1,7 +1,7 @@
 ## MCP (Model Context Protocol) client for NimCode.
 ## Supports stdio transport for local MCP servers.
 
-import std/[json, os, osproc, streams, strutils, tables, locks]
+import std/[json, os, osproc, streams, strutils, tables, times]
 
 const mcpProtocolVersion* = "2024-11-05"
 
@@ -21,46 +21,13 @@ type
     process: Process
     stdinStream: Stream
     stdoutStream: Stream
-    pending: Table[int, proc(resp: MCPResponse)]
-    lock: Lock
     nextId: int
-    closed: bool
-    readThread: Thread[MCPClient]
-
-proc readLoop(client: MCPClient) {.thread.} =
-  ## Background thread reading JSON-RPC responses from stdout
-  while not client.closed:
-    try:
-      let line = client.stdoutStream.readLine()
-      if line.strip() == "":
-        continue
-      var resp: MCPResponse
-      try:
-        let j = parseJson(line)
-        resp.id = j{"id"}
-        resp.result = j{"result"}
-        resp.error = j{"error"}
-      except JsonParsingError:
-        continue
-      
-      # Find pending callback
-      if resp.id != nil and resp.id.kind == JInt:
-        let id = resp.id.getInt()
-        withLock client.lock:
-          if client.pending.hasKey(id):
-            let cb = client.pending[id]
-            client.pending.del(id)
-            cb(resp)
-    except:
-      if client.closed:
-        break
-      continue
+    closed*: bool
 
 proc sendRequest(client: MCPClient, mcpMethod: string, params: JsonNode): int =
   ## Send a JSON-RPC request, return the request ID
-  withLock client.lock:
-    client.nextId += 1
-    result = client.nextId
+  client.nextId += 1
+  result = client.nextId
   
   var request = %*{
     "jsonrpc": "2.0",
@@ -74,44 +41,71 @@ proc sendRequest(client: MCPClient, mcpMethod: string, params: JsonNode): int =
   client.stdinStream.write(line)
   client.stdinStream.flush()
 
+proc readResponse(client: MCPClient, timeout: int = 15000): MCPResponse =
+  ## Read a JSON-RPC response from stdout with timeout
+  let startTime = getTime()
+  while not client.closed:
+    let elapsed = (getTime() - startTime).inMilliseconds
+    if elapsed > timeout:
+      raise newException(CatchableError, "MCP read timeout")
+    
+    # Check if data is available
+    if client.stdoutStream.atEnd():
+      sleep(10)
+      continue
+    
+    try:
+      let line = client.stdoutStream.readLine()
+      if line.strip() == "":
+        continue
+      
+      let j = parseJson(line)
+      result.id = j{"id"}
+      result.result = j{"result"}
+      result.error = j{"error"}
+      return
+    except JsonParsingError:
+      continue
+    except:
+      if client.closed:
+        raise newException(CatchableError, "MCP client closed")
+      sleep(10)
+      continue
+  
+  raise newException(CatchableError, "MCP client closed")
+
 proc call*(client: MCPClient, mcpMethod: string, params: JsonNode, timeout: int = 15000): JsonNode =
   ## Call an MCP method and wait for the response
   if client.closed:
     raise newException(CatchableError, "MCP client is closed")
   
-  var response: MCPResponse
-  var responded = false
-  var responseLock: Lock
-  initLock(responseLock)
-  
   let id = client.sendRequest(mcpMethod, params)
   
-  # Register callback
-  proc onResponse(resp: MCPResponse) =
-    withLock responseLock:
-      response = resp
-      responded = true
-  
-  withLock client.lock:
-    client.pending[id] = onResponse
-  
-  # Wait for response with timeout
+  # Read responses until we get one matching our ID
   let startTime = getTime()
-  while not responded:
+  while not client.closed:
     let elapsed = (getTime() - startTime).inMilliseconds
     if elapsed > timeout:
-      withLock client.lock:
-        if client.pending.hasKey(id):
-          client.pending.del(id)
       raise newException(CatchableError, "MCP call timeout: " & mcpMethod)
-    sleep(10)
+    
+    try:
+      let resp = client.readResponse(timeout = min(timeout - int(elapsed), 1000))
+      
+      # Check if this response matches our request
+      if resp.id != nil and resp.id.kind == JInt and resp.id.getInt() == id:
+        if resp.error != nil:
+          let errMsg = resp.error{"message"}.getStr("unknown error")
+          let errCode = resp.error{"code"}.getInt(0)
+          raise newException(CatchableError, "MCP error " & $errCode & ": " & errMsg)
+        return resp.result
+      
+      # If it's a notification or different response, skip it
+    except CatchableError as e:
+      if "timeout" in e.msg.toLower:
+        continue
+      raise
   
-  if response.error != nil:
-    let errMsg = response.error{"message"}.getStr("unknown error")
-    let errCode = response.error{"code"}.getInt(0)
-    raise newException(CatchableError, "MCP error " & $errCode & ": " & errMsg)
-  
-  return response.result
+  raise newException(CatchableError, "MCP client closed")
 
 proc notify*(client: MCPClient, mcpMethod: string, params: JsonNode) =
   ## Send a JSON-RPC notification (no response expected)
@@ -181,14 +175,9 @@ proc newMCPClient*(name: string, command: string, args: seq[string] = @[], env: 
     process: process,
     stdinStream: process.inputStream(),
     stdoutStream: process.outputStream(),
-    pending: initTable[int, proc(resp: MCPResponse)](),
     nextId: 0,
     closed: false,
   )
-  initLock(result.lock)
-  
-  # Start read loop
-  createThread(result.readThread, readLoop, result)
   
   # Initialize MCP
   let initParams = %*{
