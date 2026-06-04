@@ -180,14 +180,19 @@
 - [ ] 用户手册
 
 ### Phase 8: 高级特性
-- [ ] Hermes WebSocket 支持
-- [ ] A2A 完整实现 (streaming, push notifications)
-- [ ] ACP 完整实现 (资源读取, 提示模板)
+- [x] Hermes SSE (Server-Sent Events) 支持
+- [x] A2A 服务器 CLI 集成 (--a2a 标志)
+- [x] Cron 调度器后台线程
+- [x] Provider 代理 HTTP 支持 (httpProxy)
+- [x] Memory 工具 (memory_read/memory_write)
+- [x] A2A dispatch 工具 (发送任务到远程 A2A 服务器)
+- [x] A2A 流式支持 (SSE, task/get, task/cancel, 订阅)
+- [x] ACP 完整实现 (资源读取, 提示模板, 会话管理)
+- [x] 斜杠命令 (/clear, /mode, /compact, /model, /provider, /thinking, /help, /cycle)
+- [x] 工具调用显示参数
+- [x] ESC 中断支持
 - [ ] Messaging 平台集成 (WeChat, Feishu)
 - [ ] TUI 界面 (bubbletea 等效)
-- [ ] Provider 代理 HTTP 支持
-- [ ] Cron 调度器后台线程
-- [ ] A2A 服务器 CLI 集成 (--a2a 标志)
 
 ### Phase 9: 性能优化
 - [ ] 并发工具执行
@@ -236,7 +241,21 @@ make release
 
 ## 版本历史
 
-### v0.1.1 (当前)
+### v0.1.2 (当前)
+- Provider HTTP 代理支持 (httpProxy)
+- Cron 调度器后台线程
+- A2A 服务器 CLI 集成 (--a2a 标志)
+- Hermes SSE (Server-Sent Events) 支持
+- Memory 工具 (memory_read/memory_write)
+- A2A dispatch 工具
+- A2A 流式支持 (SSE, task/get, task/cancel, 订阅)
+- ACP 完整实现 (资源读取, 提示模板, 会话管理)
+- 斜杠命令 (/clear, /mode, /compact, /model, /provider, /thinking, /help, /cycle)
+- 工具调用显示参数 (toolArgs)
+- ESC 中断支持
+- Tab 模式切换提示
+
+### v0.1.1
 - 初始功能移植
 - Provider 增强
 - MCP/Cron/Sandbox 支持
@@ -301,6 +320,6 @@ src/nimcode/
 
 - **总文件数**: 25 个 Nim 源文件
 - **代码行数**: ~92,000 行 (编译后)
-- **工具数量**: 12 个内置工具 + MCP 工具 + Web Search
+- **工具数量**: 15 个内置工具 + MCP 工具 + Web Search
 - **Provider 数量**: 4 个 (OpenAI, Anthropic, Google, DeepSeek)
 - **协议支持**: 3 个 (MCP, A2A, ACP)

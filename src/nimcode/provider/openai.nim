@@ -13,13 +13,20 @@ type
     disableReasoning*: bool ## Disable reasoning_content support for incompatible APIs
     thinkingFormat*: string ## "", "openai", "deepseek", "xiaomi"
 
-proc newOpenAiProvider*(apiKey, baseUrl: string, retryEnabled: bool = true, maxRetries: int = 3, baseDelayMs: int = 2000): OpenAiProvider =
+proc newHttpClientWithProxy(proxyUrl: string, timeout: int = 300_000): HttpClient =
+  ## Create an HTTP client with optional proxy support
+  if proxyUrl.strip() == "":
+    return newHttpClient(timeout = timeout)
+  let proxy = newProxy(proxyUrl.strip())
+  return newHttpClient(timeout = timeout, proxy = proxy)
+
+proc newOpenAiProvider*(apiKey, baseUrl: string, retryEnabled: bool = true, maxRetries: int = 3, baseDelayMs: int = 2000, proxyUrl: string = ""): OpenAiProvider =
   let base = if baseUrl == "": "https://api.openai.com/v1" else: baseUrl.strip(chars = {'/'})
   result = OpenAiProvider(
     name: "openai",
     apiKey: apiKey,
     baseUrl: base,
-    client: newHttpClient(timeout = 300_000),
+    client: newHttpClientWithProxy(proxyUrl),
     retryEnabled: retryEnabled,
     maxRetries: maxRetries,
     baseDelayMs: baseDelayMs,

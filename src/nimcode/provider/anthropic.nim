@@ -12,13 +12,17 @@ type
     cacheControlEnabled*: bool
     thinkingFormat*: string ## "", "anthropic", "deepseek", "xiaomi"
 
-proc newAnthropicProvider*(apiKey, baseUrl: string, retryEnabled: bool = true, maxRetries: int = 3, baseDelayMs: int = 2000): AnthropicProvider =
+proc newAnthropicProvider*(apiKey, baseUrl: string, retryEnabled: bool = true, maxRetries: int = 3, baseDelayMs: int = 2000, proxyUrl: string = ""): AnthropicProvider =
   let base = if baseUrl == "": "https://api.anthropic.com" else: baseUrl.strip(chars = {'/'})
+  let client = if proxyUrl.strip() != "":
+    newHttpClient(timeout = 300_000, proxy = newProxy(proxyUrl.strip()))
+  else:
+    newHttpClient(timeout = 300_000)
   result = AnthropicProvider(
     name: "anthropic",
     apiKey: apiKey,
     baseUrl: base,
-    client: newHttpClient(timeout = 300_000),
+    client: client,
     retryEnabled: retryEnabled,
     maxRetries: maxRetries,
     baseDelayMs: baseDelayMs,

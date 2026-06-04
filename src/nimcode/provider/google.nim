@@ -10,13 +10,17 @@ type
     maxRetries*: int
     baseDelayMs*: int
 
-proc newGoogleGeminiProvider*(apiKey, baseUrl: string, retryEnabled: bool = true, maxRetries: int = 3, baseDelayMs: int = 2000): GoogleGeminiProvider =
+proc newGoogleGeminiProvider*(apiKey, baseUrl: string, retryEnabled: bool = true, maxRetries: int = 3, baseDelayMs: int = 2000, proxyUrl: string = ""): GoogleGeminiProvider =
   let defaultBaseUrl = "https://generativelanguage.googleapis.com/v1beta/models"
+  let client = if proxyUrl.strip() != "":
+    newHttpClient(timeout = 300_000, proxy = newProxy(proxyUrl.strip()))
+  else:
+    newHttpClient(timeout = 300_000)
   result = GoogleGeminiProvider(
     name: "google-gemini",
     apiKey: apiKey,
     baseUrl: if baseUrl == "": defaultBaseUrl else: baseUrl.strip(chars = {'/'}),
-    client: newHttpClient(timeout = 300_000),
+    client: client,
     retryEnabled: retryEnabled,
     maxRetries: maxRetries,
     baseDelayMs: baseDelayMs,

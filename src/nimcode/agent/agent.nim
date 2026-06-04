@@ -24,6 +24,7 @@ type
     settings*: Settings    ## Settings for approval rules
     compactionSettings*: contextModule.CompactionSettings
     thinkingLevel*: ThinkingLevel  ## Thinking/reasoning level
+    interruptCheck*: proc(): bool {.closure.}  ## Optional interrupt check callback
 
 proc newAgent*(
   provider: Provider,
@@ -193,6 +194,11 @@ proc processAgentTurnStream*(agent: Agent, userMsg: string, callback: AgentEvent
         discard
     
     agent.provider.chatStream(params, onStreamEvent)
+    
+    # Check for interrupt
+    if agent.interruptCheck != nil and agent.interruptCheck():
+      callback(AgentEvent(kind: aekTextDelta, textDelta: "\n[Interrupted]\n"))
+      return
     
     if hasError:
       return

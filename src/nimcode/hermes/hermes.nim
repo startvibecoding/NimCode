@@ -1,9 +1,9 @@
 ## Hermes daemon for NimCode.
-## Provides a long-running HTTP server with webhook and WebSocket support.
+## Provides a long-running HTTP server with webhook and SSE (Server-Sent Events) support.
 
-import std/[json, os, strutils, times, tables, asynchttpserver, asyncdispatch, httpclient, net]
+import std/[json, os, strutils, times, tables, asynchttpserver, asyncdispatch, httpclient, net, sequtils]
 
-const hermesVersion* = "0.1.1"
+const hermesVersion* = "0.1.2"
 
 type
   HermesConfig* = object
@@ -22,6 +22,8 @@ type
   HermesServer* = ref object
     config*: HermesConfig
     running*: bool
+    sseClients*: seq[Request]  ## Connected SSE clients
+    eventLog*: seq[JsonNode]   ## Recent events for replay
 
 proc defaultHermesConfig*(): HermesConfig =
   HermesConfig(
@@ -33,6 +35,8 @@ proc newHermesServer*(config: HermesConfig): HermesServer =
   result = HermesServer(
     config: config,
     running: false,
+    sseClients: @[],
+    eventLog: @[],
   )
 
 proc handleHealth(server: HermesServer, req: Request) {.async.} =
@@ -75,6 +79,14 @@ proc handleChat(server: HermesServer, req: Request) {.async.} =
     let provider = body{"provider"}.getStr(server.config.provider)
     let model = body{"model"}.getStr(server.config.model)
     
+    # Broadcast to SSE clients
+    let event = %*{
+      "event": "chat_message",
+      "data": {"message": message, "provider": provider, "model": model},
+      "timestamp": $getTime()
+    }
+    server.eventLog.add(event)
+    
     # In a full implementation, this would create an agent and process the message
     # For now, return a placeholder response
     let resp = %*{
@@ -88,6 +100,57 @@ proc handleChat(server: HermesServer, req: Request) {.async.} =
     let error = %*{"error": e.msg}
     await req.respond(Http400, $error, newHttpHeaders([("Content-Type", "application/json")]))
 
+proc handleSSE(server: HermesServer, req: Request) {.async.} =
+  ## Handle GET /events - Server-Sent Events endpoint
+  var headers = newHttpHeaders([
+    ("Content-Type", "text/event-stream"),
+    ("Cache-Control", "no-cache"),
+    ("Connection", "keep-alive"),
+  ])
+  
+  # Send SSE headers - we need to use raw socket for SSE
+  let responseStr = "HTTP/1.1 200 OK\r\n" &
+    "Content-Type: text/event-stream\r\n" &
+    "Cache-Control: no-cache\r\n" &
+    "Connection: keep-alive\r\n\r\n"
+  
+  try:
+    req.client.send(responseStr)
+    server.sseClients.add(req)
+    
+    # Send initial connection event
+    req.client.send("event: connected\ndata: {\"status\": \"connected\"}\n\n")
+    
+    # Keep connection alive with heartbeat
+    while server.running:
+      sleep(1000)
+      try:
+        req.client.send(": heartbeat\n\n")
+      except:
+        break
+  except:
+    discard
+  
+  # Remove client when disconnected
+  let idx = server.sseClients.find(req)
+  if idx >= 0:
+    server.sseClients.delete(idx)
+
+proc broadcastEvent*(server: HermesServer, event: JsonNode) =
+  ## Broadcast an event to all connected SSE clients
+  let eventData = "event: " & event{"event"}.getStr("message") & "\ndata: " & $event & "\n\n"
+  var disconnected: seq[int] = @[]
+  
+  for i, client in server.sseClients:
+    try:
+      client.client.send(eventData)
+    except:
+      disconnected.add(i)
+  
+  # Remove disconnected clients
+  for i in countdown(disconnected.len - 1, 0):
+    server.sseClients.delete(disconnected[i])
+
 proc handleRequest(server: HermesServer, req: Request) {.async.} =
   ## Route incoming requests
   let path = req.url.path
@@ -96,6 +159,8 @@ proc handleRequest(server: HermesServer, req: Request) {.async.} =
   of HttpGet:
     if path == "/health":
       await server.handleHealth(req)
+    elif path == "/events":
+      await server.handleSSE(req)
     else:
       await req.respond(Http404, "Not Found")
   of HttpPost:
@@ -129,6 +194,7 @@ proc start*(server: HermesServer) {.async.} =
   echo ""
   echo "Endpoints:"
   echo "  GET  /health    - Health check"
+  echo "  GET  /events    - Server-Sent Events stream"
   echo "  POST /webhook   - Webhook receiver"
   echo "  POST /chat      - Chat with agent"
   
@@ -137,4 +203,11 @@ proc start*(server: HermesServer) {.async.} =
 proc stop*(server: HermesServer) =
   ## Stop the Hermes daemon
   server.running = false
+  # Close all SSE connections
+  for client in server.sseClients:
+    try:
+      client.client.close()
+    except:
+      discard
+  server.sseClients = @[]
   echo "Hermes daemon stopped"

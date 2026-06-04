@@ -1,4 +1,4 @@
-import std/[json, os, osproc, strutils, options, algorithm, sequtils, times, streams, base64, tables]
+import std/[json, os, osproc, strutils, options, algorithm, sequtils, times, streams, base64, tables, httpclient]
 import ../provider/types
 import ../cron/cron as cronModule
 import ../mcp/mcp as mcpModule
@@ -637,6 +637,170 @@ proc executeSpawn(tool: Tool, params: JsonNode): ToolResult =
   except CatchableError as e:
     return newToolResult("Spawn error: " & e.msg, true)
 
+# Memory Tools
+proc memoryReadToolParams(): JsonNode =
+  %*{
+    "type": "object",
+    "properties": {
+      "query": {"type": "string", "description": "Optional search query to filter memory entries"},
+      "maxEntries": {"type": "integer", "description": "Maximum number of entries to return (default: 20)"}
+    },
+    "required": []
+  }
+
+proc memoryWriteToolParams(): JsonNode =
+  %*{
+    "type": "object",
+    "properties": {
+      "content": {"type": "string", "description": "Content to write to memory"},
+      "append": {"type": "boolean", "description": "If true, append to existing memory. If false, replace. Default: true"}
+    },
+    "required": ["content"]
+  }
+
+proc executeMemoryRead(tool: Tool, params: JsonNode): ToolResult =
+  let memoryPath = getHomeDir() / ".nimcode" / "memory.md"
+  let query = params{"query"}.getStr("")
+  let maxEntries = params{"maxEntries"}.getInt(20)
+  
+  if not fileExists(memoryPath):
+    return newToolResult("No memory file found at: " & memoryPath)
+  
+  try:
+    let content = readFile(memoryPath)
+    if content.strip() == "":
+      return newToolResult("Memory is empty")
+    
+    if query != "":
+      # Search for matching entries
+      var entries: seq[string] = @[]
+      var currentEntry = ""
+      for line in content.splitLines():
+        if line.startsWith("## "):
+          if currentEntry != "" and currentEntry.toLower.contains(query.toLower):
+            entries.add(currentEntry)
+          currentEntry = line
+        else:
+          currentEntry.add("\n" & line)
+      if currentEntry != "" and currentEntry.toLower.contains(query.toLower):
+        entries.add(currentEntry)
+      
+      if entries.len == 0:
+        return newToolResult("No memory entries matching: " & query)
+      
+      let resultEntries = entries[max(0, entries.len - maxEntries) .. ^1]
+      return newToolResult(resultEntries.join("\n\n"))
+    else:
+      # Return all entries (limited)
+      var entries: seq[string] = @[]
+      var currentEntry = ""
+      for line in content.splitLines():
+        if line.startsWith("## "):
+          if currentEntry != "":
+            entries.add(currentEntry)
+          currentEntry = line
+        else:
+          currentEntry.add("\n" & line)
+      if currentEntry != "":
+        entries.add(currentEntry)
+      
+      let resultEntries = entries[max(0, entries.len - maxEntries) .. ^1]
+      return newToolResult(resultEntries.join("\n\n"))
+  except CatchableError as e:
+    return newToolResult("Error reading memory: " & e.msg, true)
+
+proc executeMemoryWrite(tool: Tool, params: JsonNode): ToolResult =
+  let memoryPath = getHomeDir() / ".nimcode" / "memory.md"
+  let content = params{"content"}.getStr("")
+  let append = params{"append"}.getBool(true)
+  
+  if content == "":
+    return newToolResult("content is required", true)
+  
+  try:
+    let dir = memoryPath.parentDir()
+    if not dirExists(dir):
+      createDir(dir)
+    
+    let timestamp = now().format("yyyy-MM-dd HH:mm:ss")
+    let formattedEntry = "\n## " & timestamp & "\n\n" & content & "\n"
+    
+    if append and fileExists(memoryPath):
+      let existing = readFile(memoryPath)
+      writeFile(memoryPath, existing & formattedEntry)
+    else:
+      writeFile(memoryPath, "# Memory\n" & formattedEntry)
+    
+    return newToolResult("Memory written successfully to: " & memoryPath)
+  except CatchableError as e:
+    return newToolResult("Error writing memory: " & e.msg, true)
+
+# A2A Dispatch Tool
+proc a2aDispatchToolParams(): JsonNode =
+  %*{
+    "type": "object",
+    "properties": {
+      "serverUrl": {"type": "string", "description": "URL of the A2A server (e.g., http://localhost:8181)"},
+      "message": {"type": "string", "description": "Message/task to send to the remote agent"},
+      "taskId": {"type": "string", "description": "Optional task ID (auto-generated if empty)"}
+    },
+    "required": ["serverUrl", "message"]
+  }
+
+proc executeA2ADispatch(tool: Tool, params: JsonNode): ToolResult =
+  let serverUrl = params{"serverUrl"}.getStr("")
+  let message = params{"message"}.getStr("")
+  let taskId = params{"taskId"}.getStr("")
+  
+  if serverUrl == "":
+    return newToolResult("serverUrl is required", true)
+  if message == "":
+    return newToolResult("message is required", true)
+  
+  let client = newHttpClient()
+  client.headers = newHttpHeaders([("Content-Type", "application/json")])
+  
+  let request = %*{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "tasks/send",
+    "params": {
+      "id": taskId,
+      "message": {
+        "role": "user",
+        "parts": [{"type": "text", "text": message}]
+      }
+    }
+  }
+  
+  try:
+    let response = client.postContent(serverUrl, $request)
+    let respJson = parseJson(response)
+    
+    if respJson.hasKey("error"):
+      let error = respJson["error"]
+      return newToolResult("A2A error: " & error{"message"}.getStr("Unknown error"), true)
+    
+    if respJson.hasKey("result"):
+      let result = respJson["result"]
+      let state = result{"state"}.getStr("unknown")
+      var responseText = "Task state: " & state
+      
+      if result.hasKey("artifacts") and result["artifacts"].kind == JArray:
+        for art in result["artifacts"]:
+          let artName = art{"name"}.getStr("")
+          if art.hasKey("parts") and art["parts"].kind == JArray:
+            for part in art["parts"]:
+              let partText = part{"text"}.getStr("")
+              if partText != "":
+                responseText.add("\n\n" & (if artName != "": artName & ": " else: "") & partText)
+      
+      return newToolResult(responseText)
+    
+    return newToolResult("A2A response: " & response)
+  except CatchableError as e:
+    return newToolResult("A2A dispatch error: " & e.msg, true)
+
 # Tool Registry
 type
 # MCP tool info for execution
@@ -686,6 +850,9 @@ proc newToolRegistry*(workDir: string, skillsDir: string = "", sandboxEnabled: b
   result.tools.add(Tool(name: "cron", description: "Manage scheduled tasks (cron jobs). Create one-time or periodic background tasks.", parameters: cronToolParams(), workDir: workDir))
   result.tools.add(Tool(name: "spawn", description: "Spawn a sub-agent to handle a task in parallel. The sub-agent runs independently and returns results.", parameters: spawnToolParams(), workDir: workDir))
   result.tools.add(Tool(name: "skill_ref", description: "Load a reference file from an active skill. Use this to access on-demand knowledge from skills that have reference files.", parameters: skillRefToolParams(), workDir: workDir))
+  result.tools.add(Tool(name: "memory_read", description: "Read from persistent memory (memory.md). Search or list recent entries.", parameters: memoryReadToolParams(), workDir: workDir))
+  result.tools.add(Tool(name: "memory_write", description: "Write to persistent memory (memory.md). Store important information for future reference.", parameters: memoryWriteToolParams(), workDir: workDir))
+  result.tools.add(Tool(name: "a2a_dispatch", description: "Send a task to a remote A2A (Agent-to-Agent) server. Enables inter-agent communication.", parameters: a2aDispatchToolParams(), workDir: workDir))
 
 proc getTool*(registry: ToolRegistry, name: string): Option[Tool] =
   for t in registry.tools:
@@ -736,6 +903,12 @@ proc execute*(registry: ToolRegistry, toolName: string, params: JsonNode): ToolR
       return newToolResult(readFile(fullPath))
     except CatchableError as e:
       return newToolResult("Error reading reference: " & e.msg, true)
+  of "memory_read":
+    return tool.executeMemoryRead(params)
+  of "memory_write":
+    return tool.executeMemoryWrite(params)
+  of "a2a_dispatch":
+    return tool.executeA2ADispatch(params)
   else:
     # Check if it's an MCP tool
     if registry.mcpTools.hasKey(toolName):

@@ -1,7 +1,8 @@
 ## Cron/scheduler module for NimCode.
 ## Supports one-shot and periodic scheduled tasks.
+## Includes a background scheduler that checks for due jobs.
 
-import std/[json, os, times, strutils, algorithm, random]
+import std/[json, os, times, strutils, algorithm, random, osproc, streams, threadpool]
 
 type
   CronJob* = object
@@ -164,3 +165,128 @@ proc formatJobs*(store: CronStore): string =
   result = "Cron jobs (" & $jobs.len & "):\n\n"
   for job in jobs:
     result &= formatJob(job) & "\n"
+
+# ---- Background Scheduler ----
+
+type
+  CronScheduler* = ref object
+    store*: CronStore
+    nimcodeBin*: string      ## Path to nimcode binary for spawning agents
+    interval*: int           ## Check interval in seconds (default: 30)
+    running*: bool
+    workDir*: string
+
+proc newCronScheduler*(store: CronStore, nimcodeBin: string = "", interval: int = 30, workDir: string = ""): CronScheduler =
+  let bin = if nimcodeBin != "": nimcodeBin else: "nimcode"
+  let dir = if workDir != "": workDir else: getCurrentDir()
+  result = CronScheduler(
+    store: store,
+    nimcodeBin: bin,
+    interval: interval,
+    running: false,
+    workDir: dir,
+  )
+
+proc parseScheduleNext*(schedule: string, fromTime: Time): Time =
+  ## Parse schedule and return next run time
+  let lower = schedule.strip.toLower
+  if lower == "@daily" or lower == "@day":
+    return fromTime + initDuration(hours = 24)
+  elif lower == "@hourly" or lower == "@hour":
+    return fromTime + initDuration(hours = 1)
+  elif lower == "@weekly" or lower == "@week":
+    return fromTime + initDuration(days = 7)
+  elif lower.startsWith("@every "):
+    let durationStr = lower[7 .. ^1].strip
+    var seconds = 0
+    if durationStr.endsWith("m"):
+      seconds = parseInt(durationStr[0 .. ^2]) * 60
+    elif durationStr.endsWith("h"):
+      seconds = parseInt(durationStr[0 .. ^2]) * 3600
+    elif durationStr.endsWith("s"):
+      seconds = parseInt(durationStr[0 .. ^2])
+    else:
+      seconds = parseInt(durationStr)
+    if seconds > 0:
+      return fromTime + initDuration(seconds = seconds)
+  # Default: 1 hour
+  return fromTime + initDuration(hours = 1)
+
+proc isDue(job: CronJob, now: Time): bool =
+  ## Check if a job is due to run
+  if not job.enabled:
+    return false
+  if job.lastStatus == "running":
+    return false
+  # If never run, run now
+  let zeroTime: Time = fromUnix(0)
+  if job.lastRun == zeroTime:
+    return true
+  # If next run is set and has passed
+  if job.nextRun != zeroTime and now > job.nextRun:
+    return true
+  return false
+
+proc executeCronJob(scheduler: CronScheduler, job: CronJob) =
+  ## Execute a cron job by spawning a nimcode agent
+  stderr.writeLine("Cron: Running job '" & job.name & "' (" & job.id & ")")
+  scheduler.store.markRun(job.id, "running")
+  
+  try:
+    let modeFlag = if job.mode == "yolo": "-M yolo" else: "-M agent"
+    let cmd = scheduler.nimcodeBin & " " & modeFlag & " -P \"" & job.prompt & "\""
+    let (output, exitCode) = execCmdEx(cmd, workingDir = scheduler.workDir)
+    
+    if exitCode == 0:
+      scheduler.store.markRun(job.id, "success")
+      stderr.writeLine("Cron: Job '" & job.name & "' completed successfully")
+    else:
+      scheduler.store.markRun(job.id, "failed", "Exit code: " & $exitCode & ": " & output[0 ..< min(output.len, 200)])
+      stderr.writeLine("Cron: Job '" & job.name & "' failed (exit " & $exitCode & ")")
+  except CatchableError as e:
+    scheduler.store.markRun(job.id, "failed", e.msg)
+    stderr.writeLine("Cron: Job '" & job.name & "' error: " & e.msg)
+  
+  # Update next run time
+  let jobList = scheduler.store.list()
+  for j in jobList:
+    if j.id == job.id:
+      if j.oneShot:
+        scheduler.store.setEnabled(j.id, false)
+      else:
+        let nextRun = parseScheduleNext(j.schedule, getTime())
+        # Update nextRun in store
+        for idx in 0 ..< scheduler.store.jobs.len:
+          if scheduler.store.jobs[idx].id == j.id:
+            scheduler.store.jobs[idx].nextRun = nextRun
+            break
+        scheduler.store.save()
+      break
+
+proc schedulerLoop(scheduler: CronScheduler) =
+  ## Main scheduler loop - runs in background thread
+  while scheduler.running:
+    let now = getTime()
+    let jobs = scheduler.store.list()
+    
+    for job in jobs:
+      if isDue(job, now):
+        scheduler.executeCronJob(job)
+    
+    sleep(scheduler.interval * 1000)
+
+proc start*(scheduler: CronScheduler) =
+  ## Start the background scheduler
+  if scheduler.running:
+    return
+  scheduler.running = true
+  stderr.writeLine("Cron: Scheduler started (interval: " & $scheduler.interval & "s)")
+  spawn schedulerLoop(scheduler)
+
+proc stop*(scheduler: CronScheduler) =
+  ## Stop the background scheduler
+  scheduler.running = false
+  stderr.writeLine("Cron: Scheduler stopped")
+
+proc isRunning*(scheduler: CronScheduler): bool =
+  scheduler.running

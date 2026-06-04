@@ -40,13 +40,15 @@ proc createProvider*(providerConfig: ProviderConfig, retrySettings: RetrySetting
     raise newException(CatchableError, "API key not set")
   
   let apiType = detectApiType(providerConfig.baseUrl, providerConfig.api)
+  let proxyUrl = providerConfig.httpProxy
   
   case apiType
   of "anthropic-messages":
     let p = newAnthropicProvider(apiKey, providerConfig.baseUrl,
       retryEnabled = retrySettings.enabled,
       maxRetries = retrySettings.maxRetries,
-      baseDelayMs = retrySettings.baseDelayMs)
+      baseDelayMs = retrySettings.baseDelayMs,
+      proxyUrl = proxyUrl)
     if providerConfig.thinkingFormat != "":
       p.thinkingFormat = providerConfig.thinkingFormat
     if providerConfig.cacheControl:
@@ -57,13 +59,15 @@ proc createProvider*(providerConfig: ProviderConfig, retrySettings: RetrySetting
     return newGoogleGeminiProvider(apiKey, providerConfig.baseUrl,
       retryEnabled = retrySettings.enabled,
       maxRetries = retrySettings.maxRetries,
-      baseDelayMs = retrySettings.baseDelayMs)
+      baseDelayMs = retrySettings.baseDelayMs,
+      proxyUrl = proxyUrl)
   
   of "openai-responses":
     let p = newOpenAiProvider(apiKey, providerConfig.baseUrl,
       retryEnabled = retrySettings.enabled,
       maxRetries = retrySettings.maxRetries,
-      baseDelayMs = retrySettings.baseDelayMs)
+      baseDelayMs = retrySettings.baseDelayMs,
+      proxyUrl = proxyUrl)
     p.useResponsesApi = true
     if providerConfig.thinkingFormat != "":
       p.thinkingFormat = providerConfig.thinkingFormat
@@ -73,7 +77,8 @@ proc createProvider*(providerConfig: ProviderConfig, retrySettings: RetrySetting
     let p = newOpenAiProvider(apiKey, providerConfig.baseUrl,
       retryEnabled = retrySettings.enabled,
       maxRetries = retrySettings.maxRetries,
-      baseDelayMs = retrySettings.baseDelayMs)
+      baseDelayMs = retrySettings.baseDelayMs,
+      proxyUrl = proxyUrl)
     if providerConfig.thinkingFormat != "":
       p.thinkingFormat = providerConfig.thinkingFormat
     return p
