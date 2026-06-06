@@ -86,7 +86,7 @@ proc loadContextFiles*(cwd: string, globalConfigDir: string, extraFiles: seq[str
           content: content
         ))
         break
-      except:
+      except CatchableError:
         continue
   
   # 2. Walk up from cwd to root, loading context files from parent directories
@@ -114,7 +114,7 @@ proc loadContextFiles*(cwd: string, globalConfigDir: string, extraFiles: seq[str
             content: content
           ))
           break
-        except:
+        except CatchableError:
           continue
     
     dir = parent
@@ -135,7 +135,7 @@ proc loadContextFiles*(cwd: string, globalConfigDir: string, extraFiles: seq[str
             content: content
           ))
           break
-        except:
+        except CatchableError:
           continue
 
 proc formatContextFile(f: FileContent, scope: string): string =

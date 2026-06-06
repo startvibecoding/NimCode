@@ -1,5 +1,5 @@
 # Package
-version       = "0.1.0"
+version       = "0.1.2"
 author        = "NimCode"
 description   = "NimCode - AI coding assistant in terminal"
 license       = "MIT"

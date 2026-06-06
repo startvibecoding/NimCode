@@ -44,7 +44,7 @@ proc newCronStore*(path: string): CronStore =
           job.lastStatus = j{"lastStatus"}.getStr("")
           job.lastError = j{"lastError"}.getStr("")
           result.jobs.add(job)
-    except:
+    except CatchableError:
       stderr.writeLine("Warning: could not load cron jobs: " & getCurrentExceptionMsg())
 
 proc save(store: CronStore) =

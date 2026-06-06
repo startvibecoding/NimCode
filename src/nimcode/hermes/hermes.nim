@@ -126,7 +126,7 @@ proc handleSSE(server: HermesServer, req: Request) {.async.} =
       sleep(1000)
       try:
         req.client.send(": heartbeat\n\n")
-      except:
+      except CatchableError:
         break
   except:
     discard
@@ -144,7 +144,7 @@ proc broadcastEvent*(server: HermesServer, event: JsonNode) =
   for i, client in server.sseClients:
     try:
       client.client.send(eventData)
-    except:
+    except CatchableError:
       disconnected.add(i)
   
   # Remove disconnected clients
@@ -207,7 +207,7 @@ proc stop*(server: HermesServer) =
   for client in server.sseClients:
     try:
       client.client.close()
-    except:
+    except CatchableError:
       discard
   server.sseClients = @[]
   echo "Hermes daemon stopped"

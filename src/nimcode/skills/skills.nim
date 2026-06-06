@@ -84,7 +84,7 @@ proc loadFromDir(m: Manager, dir: string, source: string) =
         source: source,
         references: references
       )
-    except:
+    except CatchableError:
       continue
 
 proc load*(m: Manager) =

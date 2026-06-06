@@ -93,14 +93,14 @@ proc formatContextFiles*(info: string): string =
   return yellow(info)
 
 proc formatMode*(mode: string): string =
-  ## Formats mode info
+  ## Formats mode info with permission description
   case mode
   of "plan":
-    return blue("Mode: PLAN")
+    return blue("Mode: PLAN (read-only)")
   of "agent":
-    return green("Mode: AGENT")
+    return green("Mode: AGENT (bash needs approval)")
   of "yolo":
-    return red("Mode: YOLO")
+    return red("Mode: YOLO (full auto)")
   else:
     return "Mode: " & mode.toUpper
 

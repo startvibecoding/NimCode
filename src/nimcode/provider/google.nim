@@ -1,6 +1,7 @@
 import std/[json, strutils, os]
 import ./types
 import ../net/streamhttp
+import ../net/retry
 
 type
   GoogleGeminiProvider* = ref object of Provider
@@ -22,21 +23,6 @@ proc newGoogleGeminiProvider*(apiKey, baseUrl: string, retryEnabled: bool = true
     maxRetries: maxRetries,
     baseDelayMs: baseDelayMs,
   )
-
-proc isRetryable(statusCode: int, errMsg: string): bool =
-  if statusCode == 429 or statusCode == 502 or statusCode == 503 or statusCode == 504:
-    return true
-  let lower = errMsg.toLower
-  if lower.contains("timeout") or lower.contains("connection reset") or
-     lower.contains("connection refused") or lower.contains("eof") or
-     lower.contains("broken pipe"):
-    return true
-  return false
-
-proc retryDelay(attempt, baseDelayMs: int): int =
-  result = baseDelayMs * (1 shl attempt)
-  if result > 30000:
-    result = 30000
 
 proc convertMessages(params: ChatParams): tuple[system: string, contents: JsonNode] =
   ## Convert messages to Google Gemini format
@@ -209,7 +195,7 @@ proc doChatStream(p: GoogleGeminiProvider, params: ChatParams, callback: StreamC
     var args: JsonNode
     try:
       args = parseJson(toolCallBuffers[i])
-    except:
+    except CatchableError:
       args = newJObject()
     let id = if tc.id == "": "toolcall_" & $i else: tc.id
     callback(StreamEvent(kind: setToolCall, toolCallId: id, toolName: tc.name, toolArgs: args))
@@ -218,38 +204,8 @@ proc doChatStream(p: GoogleGeminiProvider, params: ChatParams, callback: StreamC
 
 method chatStream*(p: GoogleGeminiProvider, params: ChatParams, callback: StreamCallback) =
   ## Streaming chat with automatic retry
-  if not p.retryEnabled:
-    try:
-      p.doChatStream(params, callback)
-    except CatchableError as e:
-      callback(StreamEvent(kind: setError, error: e.msg))
-    return
-
-  var lastError = ""
-  for attempt in 0 .. p.maxRetries:
-    try:
-      p.doChatStream(params, callback)
-      return
-    except CatchableError as e:
-      lastError = e.msg
-      var statusCode = 0
-      try:
-        let parts = lastError.split(" ")
-        if parts.len >= 3 and parts[0] == "API" and parts[1] == "error":
-          statusCode = parseInt(parts[2])
-      except:
-        discard
-
-      if not isRetryable(statusCode, lastError):
-        callback(StreamEvent(kind: setError, error: lastError))
-        return
-
-      if attempt < p.maxRetries:
-        let delay = retryDelay(attempt, p.baseDelayMs)
-        callback(StreamEvent(kind: setRetry, retryAttempt: attempt + 1, retryMax: p.maxRetries, retryError: lastError))
-        sleep(delay)
-
-  callback(StreamEvent(kind: setError, error: lastError))
+  proc doCall() = p.doChatStream(params, callback)
+  runWithRetry(doCall, p.retryEnabled, p.maxRetries, p.baseDelayMs, callback)
 
 method chat*(p: GoogleGeminiProvider, params: ChatParams): seq[StreamEvent] =
   ## Non-streaming fallback

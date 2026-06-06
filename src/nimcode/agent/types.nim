@@ -1,6 +1,11 @@
 import std/[json]
 
 type
+  ApprovalResult* = enum
+    arApproved
+    arDenied
+    arEdited
+
   AgentEventKind* = enum
     aekTextDelta = "text_delta"
     aekThinkDelta = "think_delta"
@@ -31,3 +36,6 @@ type
 
   AgentEventCallback* = proc(event: AgentEvent) {.closure.}
     ## Callback for real-time streaming of agent events
+
+  ApprovalRequestCallback* = proc(toolName: string, args: JsonNode): tuple[approved: ApprovalResult, modifiedArgs: JsonNode] {.closure.}
+    ## Callback for requesting user approval before executing a tool

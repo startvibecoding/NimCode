@@ -103,8 +103,27 @@ proc renderTui*(state: TuiState) =
   stdout.flushFile()
 
 proc addContentLine*(state: TuiState, line: string) =
-  ## Add a line to the scrolling content area
-  state.contentLines.add(line)
+  ## Add a line to the scrolling content area, splitting on newlines
+  ## so each terminal row is exactly one content line
+  if line.len == 0:
+    state.contentLines.add("")
+    return
+  let parts = line.splitLines()
+  for part in parts:
+    state.contentLines.add(part)
+
+proc appendToLastLine*(state: TuiState, text: string) =
+  ## Append text to the last content line, splitting on newlines.
+  ## Used for streaming text deltas that may contain embedded newlines.
+  if text.len == 0:
+    return
+  if state.contentLines.len == 0:
+    state.addContentLine(text)
+    return
+  let parts = text.splitLines()
+  state.contentLines[^1].add(parts[0])
+  for i in 1 ..< parts.len:
+    state.contentLines.add(parts[i])
 
 proc clearContent*(state: TuiState) =
   ## Clear all content

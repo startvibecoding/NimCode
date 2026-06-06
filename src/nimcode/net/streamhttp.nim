@@ -204,25 +204,38 @@ proc performRequest*(
 
   # Read body line-by-line
   if transferEncoding.toLower.contains("chunked"):
-    # Chunked transfer encoding
+    # Chunked transfer encoding with cross-chunk line buffering
+    var lineBuf = ""
     while true:
       # Read chunk size line
       if not socket.readLineInto(line, client.timeout):
+        # Connection closed; emit any remaining buffered line
+        if lineBuf.len > 0:
+          lineCallback(lineBuf)
         break
       var chunkSize = 0
       var hexStr = line
       let semiIdx = hexStr.find(';')
       if semiIdx >= 0:
         hexStr = hexStr[0 ..< semiIdx]
-      chunkSize = parseHexInt(hexStr.strip)
+      let stripped = hexStr.strip
+      if stripped.len == 0:
+        # Empty chunk-size line on EOF; emit buffered line if any
+        if lineBuf.len > 0:
+          lineCallback(lineBuf)
+        break
+      chunkSize = parseHexInt(stripped)
       if chunkSize <= 0:
         # Read trailing headers
         while socket.readLineInto(line, client.timeout):
           if line == "":
             break
+        # Emit any remaining buffered line
+        if lineBuf.len > 0:
+          lineCallback(lineBuf)
         break
 
-      # Read chunk data line-by-line (simplification: read chunk raw, split by LF)
+      # Read chunk data
       var chunkBuf = newString(chunkSize)
       var totalRead = 0
       while totalRead < chunkSize:
@@ -236,20 +249,21 @@ proc performRequest*(
       var crlf: array[2, char]
       discard socket.recv(addr crlf[0], 2, client.timeout)
 
-      # Emit lines from chunk
+      # Append chunk data to line buffer, emitting complete lines
+      lineBuf.add(chunkBuf)
       var start = 0
-      for i in 0 ..< chunkBuf.len:
-        if chunkBuf[i] == '\n':
-          var ln = chunkBuf[start ..< i]
+      for i in 0 ..< lineBuf.len:
+        if lineBuf[i] == '\n':
+          var ln = lineBuf[start ..< i]
           if ln.len > 0 and ln[^1] == '\r':
             ln.setLen(ln.len - 1)
           lineCallback(ln)
           start = i + 1
-      if start < chunkBuf.len:
-        var ln = chunkBuf[start .. ^1]
-        if ln.len > 0 and ln[^1] == '\r':
-          ln.setLen(ln.len - 1)
-        lineCallback(ln)
+      # Keep any trailing incomplete line in the buffer
+      if start < lineBuf.len:
+        lineBuf = lineBuf[start .. ^1]
+      else:
+        lineBuf = ""
   else:
     # Non-chunked: read until connection close
     while socket.readLineInto(line, client.timeout):

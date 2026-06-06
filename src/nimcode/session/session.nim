@@ -1,4 +1,4 @@
-import std/[json, os, times, strutils, algorithm, sequtils, base64]
+import std/[json, os, times, strutils, algorithm, sequtils, base64, random]
 import ../provider/types
 
 type
@@ -21,9 +21,14 @@ proc encodePath*(p: string): string =
   return encode(p)
 
 proc generateId*(): string =
-  ## Generate a random 8-char hex session ID
-  let now = now()
-  result = now.format("HHmmss") & $now.second
+  ## Generate a random 8-char hex session ID from secure random bytes
+  randomize()
+  var bytes: array[4, uint8]
+  for i in 0 ..< bytes.len:
+    bytes[i] = uint8(rand(256))
+  result = ""
+  for b in bytes:
+    result.add(toHex(b.int))
 
 proc sessionDir*(): string =
   let home = getHomeDir()
@@ -64,7 +69,7 @@ proc listSessionsForDir*(cwd: string): seq[SessionInfo] =
         name: entry.extractFilename,
         id: sessId
       ))
-    except:
+    except CatchableError:
       continue
   
   # Sort by modification time (newest first)
@@ -91,7 +96,7 @@ proc loadSession*(file: string): Session =
             if j.hasKey("cwd"):
               result.cwd = j["cwd"].getStr()
             continue
-        except:
+        except CatchableError:
           discard
       
       try:
@@ -110,7 +115,7 @@ proc loadSession*(file: string): Session =
             toolName: j{"toolName"}.getStr(""),
             isError: j{"isError"}.getBool(false)
           ))
-      except:
+      except CatchableError:
         continue
   except:
     discard

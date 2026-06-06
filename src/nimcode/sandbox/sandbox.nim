@@ -28,7 +28,7 @@ proc findBwrap*(): string =
     let (output, exitCode) = execCmdEx("which bwrap")
     if exitCode == 0 and output.strip() != "":
       return output.strip()
-  except:
+  except CatchableError:
     discard
   return ""
 

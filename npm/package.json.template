@@ -1,0 +1,48 @@
+{
+  "name": "@nimcode/cli",
+  "version": "{{VERSION}}",
+  "description": "NimCode - AI coding assistant in terminal",
+  "license": "MIT",
+  "author": "NimCode",
+  "homepage": "https://github.com/nimcode/nimcode",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nimcode/nimcode.git"
+  },
+  "bugs": {
+    "url": "https://github.com/nimcode/nimcode/issues"
+  },
+  "keywords": [
+    "ai",
+    "cli",
+    "coding-assistant",
+    "terminal",
+    "nim"
+  ],
+  "bin": {
+    "nimcode": "bin/nimcode"
+  },
+  "files": [
+    "bin/",
+    "install.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "postinstall": "node install.js",
+    "prepublishOnly": "echo 'Run scripts/npm-publish.sh to publish' && exit 1"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64",
+    "arm"
+  ]
+}

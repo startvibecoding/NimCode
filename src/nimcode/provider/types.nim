@@ -1,4 +1,4 @@
-import std/[json, strutils]
+import std/[json, strutils, options]
 
 type
   ## Thinking/reasoning level for reasoning models (o1, o3, DeepSeek, etc.)
@@ -27,7 +27,7 @@ type
     case kind*: ContentBlockType
     of cbtText:
       text*: string
-      textCacheControl*: ptr CacheControl  ## nil if no cache control
+      textCacheControl*: Option[CacheControl]  ## none if no cache control
     of cbtImage:
       image*: ImageData
     of cbtToolCall:
@@ -50,7 +50,7 @@ type
     toolCallId*: string
     toolName*: string
     isError*: bool
-    cacheControl*: ptr CacheControl  ## Message-level cache control
+    cacheControl*: Option[CacheControl]  ## Message-level cache control
 
   ToolDefinitionKind* = enum
     tdkFunction = "function"    ## Regular function tool

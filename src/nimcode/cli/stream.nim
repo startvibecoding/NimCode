@@ -56,8 +56,7 @@ proc tuiStreamCallback*(state: StreamCallbackState, event: AgentEvent) =
       if state.statusBar.startTime == 0:
         state.statusBar.startTimer()
     else:
-      if state.tui.contentLines.len > 0:
-        state.tui.contentLines[^1].add(event.textDelta)
+      state.tui.appendToLastLine(event.textDelta)
     if shouldRender(state):
       state.statusBar.updateStatusBar()
 
@@ -71,8 +70,7 @@ proc tuiStreamCallback*(state: StreamCallbackState, event: AgentEvent) =
       if state.statusBar.startTime == 0:
         state.statusBar.startTimer()
     else:
-      if state.tui.contentLines.len > 0:
-        state.tui.contentLines[^1].add(event.thinkDelta)
+      state.tui.appendToLastLine(event.thinkDelta)
     if shouldRender(state):
       state.statusBar.updateStatusBar()
 
@@ -85,11 +83,12 @@ proc tuiStreamCallback*(state: StreamCallbackState, event: AgentEvent) =
     forceRender(state)
 
   of aekToolResult:
-    let preview = if event.resultText.len > 100: event.resultText[0 ..< 100] & "..." else: event.resultText
+    state.tui.addContentLine("")
     if event.resultIsError:
-      state.tui.addContentLine("<< " & event.resultToolName & " error: " & preview)
+      state.tui.addContentLine("<< " & event.resultToolName & " error:")
     else:
-      state.tui.addContentLine("<< " & event.resultToolName & " " & preview)
+      state.tui.addContentLine("<< " & event.resultToolName & " result:")
+    state.tui.addContentLine(event.resultText)
     state.tui.addContentLine("")
     forceRender(state)
 

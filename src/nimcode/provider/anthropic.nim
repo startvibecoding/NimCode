@@ -1,4 +1,4 @@
-import std/[json, httpclient, strutils, os]
+import std/[json, httpclient, strutils, os, options]
 import ./types
 import ../net/streamhttp
 
@@ -63,8 +63,8 @@ proc convertMessages(params: ChatParams, cacheEnabled: bool): JsonNode =
           case c.kind
           of cbtText:
             var blk = %*{"type": "text", "text": c.text}
-            if cacheEnabled and c.textCacheControl != nil:
-              blk["cache_control"] = %*{"type": c.textCacheControl[].kind}
+            if cacheEnabled and c.textCacheControl.isSome:
+              blk["cache_control"] = %*{"type": c.textCacheControl.get.kind}
             blocks.add(blk)
           of cbtImage:
             blocks.add(%*{
@@ -201,7 +201,7 @@ proc parseAnthropicLine(p: AnthropicProvider, data: string, callback: StreamCall
         var args: JsonNode
         try:
           args = parseJson(toolCallBuffers[toolCallIdx])
-        except:
+        except CatchableError:
           args = newJObject()
         callback(StreamEvent(kind: setToolCall, toolCallId: toolCalls[toolCallIdx].id, toolName: toolCalls[toolCallIdx].name, toolArgs: args))
       toolCallIdx = -1

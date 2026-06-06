@@ -15,10 +15,10 @@ import nimcode/tui/format
 import nimcode/tui/tui
 import nimcode/tui/input
 import nimcode/tui/statusbar
+import nimcode/tui/commands
 import nimcode/cli/stream
 import nimcode/gateway/gateway
 import nimcode/mcp/mcp as mcpModule
-import nimcode/sandbox/sandbox as sandboxModule
 import nimcode/cron/cron as cronModule
 import nimcode/a2a/a2a as a2aModule
 
@@ -356,6 +356,62 @@ proc run(args: seq[string], opts: var OptParser) =
       gInterruptRequested = true
     return gInterruptRequested
 
+  # Set approval callback for TUI interactive mode (not in print mode)
+  if not printMode:
+    agent.approvalRequest = proc(toolName: string, args: JsonNode): tuple[approved: ApprovalResult, modifiedArgs: JsonNode] =
+      disableRawMode()
+      echo ""
+      echo "╭─────────────────────────────────────────── Approval Required ───────────────────────────────────────────╮"
+      echo "│ Tool: " & toolName
+      if toolName == "bash":
+        echo "│ Command: " & args{"command"}.getStr("")
+      elif toolName == "write":
+        echo "│ File: " & args{"path"}.getStr("")
+      elif toolName == "edit":
+        echo "│ File: " & args{"path"}.getStr("")
+      elif toolName == "spawn":
+        echo "│ Prompt: " & args{"prompt"}.getStr("")[0 ..< min(args{"prompt"}.getStr("").len, 80)]
+      elif toolName == "cron":
+        echo "│ Action: " & args{"action"}.getStr("")
+      elif toolName == "a2a_dispatch":
+        echo "│ Server: " & args{"serverUrl"}.getStr("")
+        echo "│ Message: " & args{"message"}.getStr("")[0 ..< min(args{"message"}.getStr("").len, 80)]
+      elif toolName == "memory_write":
+        echo "│ Content: " & args{"content"}.getStr("")[0 ..< min(args{"content"}.getStr("").len, 80)]
+      echo "├─────────────────────────────────────────────────────────────────────────────────────────────────────────┤"
+      echo "│ [y] yes  [n] no  [e] edit"
+      stdout.write "│ Approve? "
+      stdout.flushFile()
+      var response = ""
+      while true:
+        var ch = ""
+        if stdin.readLine(response):
+          response = response.strip.toLower
+          case response
+          of "y", "yes":
+            return (arApproved, args)
+          of "n", "no":
+            return (arDenied, args)
+          of "e", "edit":
+            if toolName == "bash":
+              stdout.write "│ New command: "
+              stdout.flushFile()
+              var newCmd = ""
+              if stdin.readLine(newCmd):
+                var newArgs = args
+                newArgs["command"] = %newCmd
+                return (arEdited, newArgs)
+              else:
+                return (arDenied, args)
+            else:
+              echo "│ Editing not supported for this tool, treating as denied."
+              return (arDenied, args)
+          else:
+            stdout.write "│ Please enter y/n/e: "
+            stdout.flushFile()
+        else:
+          return (arDenied, args)
+
   # Reset interrupt flag
   gInterruptRequested = false
   
@@ -456,7 +512,12 @@ proc run(args: seq[string], opts: var OptParser) =
       else: mode = "agent"
       agent.mode = mode
       statusBar.mode = mode
-      tui.addContentLine("Mode: " & mode)
+      let modeDesc = case mode
+        of "plan": "Read-Only (no write/bash/edit)"
+        of "agent": "Semi-Auto (bash needs approval)"
+        of "yolo": "Full Auto (all tools auto-execute)"
+        else: mode
+      tui.addContentLine("Mode: " & mode & " - " & modeDesc)
       statusBar.updateStatusBar()
       continue
 
@@ -469,208 +530,17 @@ proc run(args: seq[string], opts: var OptParser) =
     tui.renderTui()
     
     let cmd = input.strip
-    if cmd == "exit" or cmd == "quit":
+    let result = handleCommand(
+      cmd, agent, tui, statusBar, sess, mcpClients, cwd,
+      mode, modelName, providerName, thinkingLevel
+    )
+    case result
+    of crBreak:
       break
-    elif cmd == "clear":
-      agent.clearMessages()
-      tui.clearContent()
-      tui.addContentLine("Conversation cleared")
-      tui.renderTui()
+    of crContinue:
       continue
-    elif cmd == "help":
-      tui.addContentLine("Commands:")
-      tui.addContentLine("  clear    - Clear conversation history")
-      tui.addContentLine("  exit     - Exit NimCode")
-      tui.addContentLine("  help     - Show this help")
-      tui.addContentLine("  mode     - Show current mode")
-      tui.addContentLine("  mode <m> - Set mode (plan, agent, yolo)")
-      tui.addContentLine("  provider - Show current provider")
-      tui.addContentLine("  model    - Show current model")
-      tui.addContentLine("  thinking - Show thinking level")
-      tui.addContentLine("  session  - Show session info")
-      tui.addContentLine("  sessions - List recent sessions")
-      tui.addContentLine("  usage    - Show context usage")
-      tui.addContentLine("  mcp      - Show MCP server status")
-      tui.addContentLine("  sandbox  - Show sandbox status")
-      tui.addContentLine("  cron     - List cron jobs")
-      tui.addContentLine("  tools    - List available tools")
-      tui.addContentLine("")
-      tui.addContentLine("Keyboard shortcuts:")
-      tui.addContentLine("  Tab      - Cycle through modes")
-      tui.addContentLine("  ESC      - Interrupt running agent")
-      tui.addContentLine("  Ctrl+C   - Exit NimCode")
-      tui.renderTui()
-      continue
-    elif cmd == "mode":
-      tui.addContentLine("Mode: " & mode)
-      tui.addContentLine("Use 'mode <name>' to change (plan, agent, yolo)")
-      tui.renderTui()
-      continue
-    elif cmd == "mode plan" or cmd == "mode agent" or cmd == "mode yolo":
-      mode = cmd.split(" ")[1]
-      agent.mode = mode
-      statusBar.mode = mode
-      tui.addContentLine("Mode changed to: " & mode)
-      statusBar.updateStatusBar()
-      continue
-    elif cmd == "provider":
-      tui.addContentLine("Provider: " & providerName)
-      tui.renderTui()
-      continue
-    elif cmd == "model":
-      tui.addContentLine("Model: " & modelName)
-      tui.renderTui()
-      continue
-    elif cmd == "thinking":
-      tui.addContentLine("Thinking: " & thinkingLevel)
-      tui.renderTui()
-      continue
-    elif cmd == "session":
-      tui.addContentLine(sess.getSessionInfo())
-      tui.renderTui()
-      continue
-    elif cmd == "sessions":
-      let sessions = listSessionsForDir(cwd)
-      if sessions.len == 0:
-        tui.addContentLine("No sessions found")
-      else:
-        tui.addContentLine("Recent sessions:")
-        for s in sessions:
-          if sessions.find(s) >= 10: break
-          tui.addContentLine("  " & s.id & "  " & s.name)
-      tui.renderTui()
-      continue
-    elif cmd == "usage":
-      let usage = agent.getContextUsage()
-      tui.addContentLine("Context: " & $usage.tokens & " tokens")
-      if usage.contextWindow > 0:
-        tui.addContentLine("Window: " & $usage.contextWindow & " tokens")
-      if usage.percent.isSome:
-        tui.addContentLine("Usage: " & formatFloat(usage.percent.get, ffDecimal, 1) & "%")
-      tui.renderTui()
-      continue
-    elif cmd == "mcp":
-      if mcpClients.len == 0:
-        tui.addContentLine("No MCP servers connected")
-      else:
-        tui.addContentLine("MCP servers:")
-        for client in mcpClients:
-          let status = if client.isConnected(): "connected" else: "disconnected"
-          tui.addContentLine("  " & client.name & " (" & status & ")")
-      tui.renderTui()
-      continue
-    elif cmd == "sandbox":
-      if agent.registry.sandbox == nil:
-        tui.addContentLine("Sandbox: disabled")
-      else:
-        tui.addContentLine("Sandbox: enabled (level: " & $agent.registry.sandboxLevel & ")")
-        tui.addContentLine("  bwrap: " & (if agent.registry.sandbox.isAvailable(): "available" else: "not available"))
-      tui.renderTui()
-      continue
-    elif cmd == "cron":
-      tui.addContentLine(agent.registry.cronStore.formatJobs())
-      tui.renderTui()
-      continue
-    elif cmd == "tools":
-      tui.addContentLine("Available tools:")
-      for t in agent.registry.tools:
-        tui.addContentLine("  " & t.name & " - " & t.description[0 ..< min(t.description.len, 60)])
-      tui.renderTui()
-      continue
-    elif cmd.startsWith("mode "):
-      let newMode = cmd[5 .. ^1].strip
-      if newMode in ["plan", "agent", "yolo"]:
-        mode = newMode
-        agent.mode = mode
-        statusBar.mode = mode
-        tui.addContentLine("Mode changed to: " & mode)
-        statusBar.updateStatusBar()
-      else:
-        tui.addContentLine("Invalid mode: " & newMode)
-      tui.renderTui()
-      continue
-    elif cmd.startsWith("/"):
-      # Slash commands
-      let parts = cmd.split(" ")
-      let slashCmd = parts[0]
-      case slashCmd
-      of "/clear":
-        agent.clearMessages()
-        tui.clearContent()
-        tui.addContentLine("Conversation cleared")
-        tui.renderTui()
-      of "/mode":
-        if parts.len > 1:
-          let newMode = parts[1].strip
-          if newMode in ["plan", "agent", "yolo"]:
-            mode = newMode
-            agent.mode = mode
-            statusBar.mode = mode
-            tui.addContentLine("Mode changed to: " & mode)
-            statusBar.updateStatusBar()
-          else:
-            tui.addContentLine("Invalid mode: " & newMode)
-        else:
-          tui.addContentLine("Current mode: " & mode)
-        tui.renderTui()
-      of "/compact":
-        let summary = agent.compactContext()
-        if summary != "":
-          tui.addContentLine("Context compacted (" & $summary.len & " chars summary)")
-        else:
-          tui.addContentLine("No compaction needed")
-        tui.renderTui()
-      of "/model":
-        if parts.len > 1:
-          modelName = parts[1].strip
-          statusBar.modelName = modelName
-          tui.addContentLine("Model changed to: " & modelName)
-          statusBar.updateStatusBar()
-        else:
-          tui.addContentLine("Current model: " & modelName)
-        tui.renderTui()
-      of "/provider":
-        if parts.len > 1:
-          providerName = parts[1].strip
-          tui.addContentLine("Provider changed to: " & providerName)
-          statusBar.updateStatusBar()
-        else:
-          tui.addContentLine("Current provider: " & providerName)
-        tui.renderTui()
-      of "/thinking":
-        if parts.len > 1:
-          thinkingLevel = parts[1].strip
-          tui.addContentLine("Thinking level changed to: " & thinkingLevel)
-        else:
-          tui.addContentLine("Current thinking level: " & thinkingLevel)
-        tui.renderTui()
-      of "/help":
-        tui.addContentLine("Slash commands:")
-        tui.addContentLine("  /clear       - Clear conversation history")
-        tui.addContentLine("  /mode [mode] - Show or change mode (plan, agent, yolo)")
-        tui.addContentLine("  /cycle       - Cycle through modes (plan -> agent -> yolo -> plan)")
-        tui.addContentLine("  /compact     - Compact context (summarize old messages)")
-        tui.addContentLine("  /model [id]  - Show or change model")
-        tui.addContentLine("  /provider [name] - Show or change provider")
-        tui.addContentLine("  /thinking [level] - Show or change thinking level")
-        tui.addContentLine("  /help        - Show this help")
-        tui.renderTui()
-      of "/cycle":
-        case mode
-        of "plan": mode = "agent"
-        of "agent": mode = "yolo"
-        of "yolo": mode = "plan"
-        else: mode = "agent"
-        agent.mode = mode
-        statusBar.mode = mode
-        tui.addContentLine("Mode changed to: " & mode)
-        statusBar.updateStatusBar()
-        tui.renderTui()
-      else:
-        tui.addContentLine("Unknown command: " & slashCmd)
-        tui.addContentLine("Type '/help' for available slash commands")
-        tui.renderTui()
-      continue
+    of crProcessInput:
+      discard
     
     # Process with real-time streaming
     statusBar.startTimer()

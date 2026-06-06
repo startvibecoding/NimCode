@@ -38,11 +38,16 @@ proc newToolResult*(text: string, isError: bool = false, plan: Option[TaskPlan] 
 
 # Diff helpers
 proc buildDiffSummary(oldContent, newContent: string): string =
-  ## Build a compact diff summary showing added/removed line counts
+  ## Build a compact diff summary showing actual added/removed line counts
   let oldLines = if oldContent == "": @[] else: oldContent.splitLines()
   let newLines = if newContent == "": @[] else: newContent.splitLines()
-  let deleted = oldLines.len
-  let added = newLines.len
+  # Count common lines; additions = new - common, deletions = old - common
+  var common = 0
+  for line in oldLines:
+    if line in newLines:
+      inc common
+  let added = max(0, newLines.len - common)
+  let deleted = max(0, oldLines.len - common)
   result = "Diff: +" & $added & " -" & $deleted
 
 proc formatDiffResult(path, oldContent, newContent: string): string =
@@ -378,35 +383,101 @@ proc executeBash(tool: Tool, params: JsonNode, sandbox: sandboxModule.Sandbox = 
     except CatchableError as e:
       return newToolResult("Error starting background command: " & e.msg, true)
   
+  proc runWithTimeout(cmd: string, args: seq[string], workDir: string, maxSeconds: int): tuple[output: string, exitCode: int, timedOut: bool] =
+    ## Run a command with timeout support using simple polling
+    var process = startProcess(
+      cmd,
+      args = args,
+      options = {poStdErrToStdOut, poUsePath},
+      workingDir = workDir
+    )
+    defer: process.close()
+
+    let stream = process.outputStream()
+    var output = ""
+    let start = epochTime()
+    let deadline = start + maxSeconds.float
+    var buf: array[4096, char]
+    var timedOut = false
+
+    while true:
+      let now = epochTime()
+      if now >= deadline:
+        timedOut = true
+        try:
+          process.kill()
+        except CatchableError:
+          discard
+        break
+
+      if stream != nil:
+        let n = stream.readData(addr buf[0], buf.len)
+        if n > 0:
+          for i in 0 ..< n:
+            output.add(buf[i])
+          if output.len > 100_000:
+            output.add("\n... (truncated due to size)\n")
+            try:
+              process.kill()
+            except CatchableError:
+              discard
+            break
+
+      if not process.running():
+        # Drain remaining output
+        if stream != nil:
+          while true:
+            let n = stream.readData(addr buf[0], buf.len)
+            if n <= 0: break
+            for i in 0 ..< n:
+              output.add(buf[i])
+        break
+
+      sleep(10)  # 10ms polling interval
+
+    let exitCode = if timedOut: -1 else: process.waitForExit()
+    return (output, exitCode, timedOut)
+
   try:
     var output: string
     var exitCode: int
-    
+    var timedOut = false
+
     # Use sandbox if available and enabled
     if sandbox != nil and sandbox.isAvailable():
       let shell = getEnv("SHELL", "/bin/sh")
       let wrappedCmd = sandbox.wrapCommand(shell, command, timeout)
       if wrappedCmd.len > 0:
-        let process = startProcess(
-          wrappedCmd[0],
-          args = wrappedCmd[1 .. ^1],
-          options = {poStdErrToStdOut},
-          workingDir = tool.workDir
-        )
-        output = process.outputStream().readAll()
-        exitCode = process.waitForExit()
-        process.close()
+        var wrappedArgs: seq[string] = @[]
+        if wrappedCmd.len > 1:
+          wrappedArgs = wrappedCmd[1 .. ^1]
+        let res = runWithTimeout(wrappedCmd[0], wrappedArgs, tool.workDir, timeout)
+        output = res.output
+        exitCode = res.exitCode
+        timedOut = res.timedOut
       else:
-        # Fallback to normal execution
-        (output, exitCode) = execCmdEx(command, options = {}, workingDir = tool.workDir)
+        # Fallback to normal execution via shell
+        let shell = getEnv("SHELL", "/bin/sh")
+        let res = runWithTimeout(shell, @["-c", command], tool.workDir, timeout)
+        output = res.output
+        exitCode = res.exitCode
+        timedOut = res.timedOut
     else:
-      (output, exitCode) = execCmdEx(command, options = {}, workingDir = tool.workDir)
-    
-    var result = "[command]\n" & command & "\n[cwd]\n" & tool.workDir & "\n[stdout]\n" & output & "\n[exit_code]\n" & $exitCode
-    
+      # Run via shell so pipes/redirections work
+      let shell = getEnv("SHELL", "/bin/sh")
+      let res = runWithTimeout(shell, @["-c", command], tool.workDir, timeout)
+      output = res.output
+      exitCode = res.exitCode
+      timedOut = res.timedOut
+
+    var result = "[command]\n" & command & "\n[cwd]\n" & tool.workDir & "\n"
+    if timedOut:
+      result.add("[status]\ntimeout after " & $timeout & "s\n")
+    result.add("[stdout]\n" & output & "\n[exit_code]\n" & $exitCode)
+
     if result.len > 50000:
       result = result[0 ..< 50000] & "\n... (truncated)"
-    
+
     return newToolResult(result)
   except CatchableError as e:
     return newToolResult("Error executing command: " & e.msg, true)
@@ -537,7 +608,7 @@ proc executeFind(tool: Tool, params: JsonNode): ToolResult =
   try:
     let process = startProcess(
       "find",
-      args = @["-L", fullPath, "-name", pattern],
+      args = @[fullPath, "-name", pattern],
       options = {poStdErrToStdOut, poUsePath},
       workingDir = tool.workDir
     )

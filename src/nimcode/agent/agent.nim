@@ -25,6 +25,7 @@ type
     compactionSettings*: contextModule.CompactionSettings
     thinkingLevel*: ThinkingLevel  ## Thinking/reasoning level
     interruptCheck*: proc(): bool {.closure.}  ## Optional interrupt check callback
+    approvalRequest*: ApprovalRequestCallback  ## Optional approval callback for TUI
 
 proc newAgent*(
   provider: Provider,
@@ -62,20 +63,59 @@ proc newAgent*(
 proc clearMessages*(agent: Agent) =
   agent.messages = @[]
 
+## Tools allowed in read-only plan mode
+const PlanModeReadOnlyTools* = ["read", "ls", "grep", "find", "plan", "memory_read", "skill_ref"]
+
+proc isReadOnlyTool*(toolName: string): bool =
+  for t in PlanModeReadOnlyTools:
+    if t == toolName:
+      return true
+  return false
+
+proc getAllowedToolNames*(agent: Agent): seq[string] =
+  ## Return list of tool names allowed for current mode
+  if agent.mode == "plan":
+    return @PlanModeReadOnlyTools
+  else:
+    return agent.registry.definitions().mapIt(it.name)
+
 proc needsApproval*(agent: Agent, toolName: string, args: JsonNode): bool =
+  ## Determine if a tool call needs user approval before execution
   if agent.settings == nil:
     return false
+
+  # Plan mode: read-only tools never need approval (already filtered)
   if agent.mode == "plan":
     return false
-  if agent.mode == "agent" and toolName == "bash":
-    let command = args{"command"}.getStr("")
-    for prefix in agent.settings.approval.bashWhitelist:
-      if command.startsWith(prefix):
-        return false
-    return true
-  if agent.mode == "agent" and agent.settings.approval.confirmBeforeWrite:
-    if toolName in ["write", "edit"]:
+
+  # YOLO mode: never needs approval
+  if agent.mode == "yolo":
+    return false
+
+  # Agent mode: selective approval
+  if agent.mode == "agent":
+    # Bash commands require approval unless whitelisted
+    if toolName == "bash":
+      let command = args{"command"}.getStr("")
+      # Check blacklist first
+      for prefix in agent.settings.approval.bashBlacklist:
+        if command.startsWith(prefix):
+          return true
+      # Then check whitelist
+      for prefix in agent.settings.approval.bashWhitelist:
+        if command.startsWith(prefix):
+          return false
       return true
+
+    # Potentially destructive write/edit operations
+    if agent.settings.approval.confirmBeforeWrite:
+      if toolName in ["write", "edit"]:
+        return true
+
+    # Other sensitive operations
+    if toolName in ["spawn", "cron", "memory_write", "a2a_dispatch"]:
+      return true
+
   return false
 
 proc getContextUsage*(agent: Agent): ContextUsage =
@@ -157,9 +197,17 @@ proc processAgentTurnStream*(agent: Agent, userMsg: string, callback: AgentEvent
   while iterations < maxIterations:
     iterations += 1
     
+    # Filter tools based on current mode
+    let allowedToolNames = agent.getAllowedToolNames()
+    let allDefs = agent.registry.definitions()
+    var filteredDefs: seq[ToolDefinition] = @[]
+    for d in allDefs:
+      if d.name in allowedToolNames:
+        filteredDefs.add(d)
+
     let params = ChatParams(
       messages: agent.messages,
-      tools: agent.registry.definitions(),
+      tools: filteredDefs,
       systemPrompt: systemPrompt,
       maxTokens: agent.maxTokens,
       modelId: agent.modelId,
@@ -214,15 +262,38 @@ proc processAgentTurnStream*(agent: Agent, userMsg: string, callback: AgentEvent
       callback(AgentEvent(kind: aekDone, doneStopReason: "stop"))
       return
     
-    # Execute tool calls
+    # Execute tool calls (with approval check in agent mode)
     for tc in toolCalls:
-      let toolResult = agent.registry.execute(tc.name, tc.args)
+      var finalArgs = tc.args
+      var toolResult: ToolResult
+      var wasDenied = false
+
+      # Check if approval is needed
+      if agent.needsApproval(tc.name, tc.args):
+        if agent.approvalRequest != nil:
+          let approval = agent.approvalRequest(tc.name, tc.args)
+          case approval.approved
+          of arDenied:
+            wasDenied = true
+            toolResult = newToolResult("Tool execution denied by user: " & tc.name, true)
+          of arEdited:
+            finalArgs = approval.modifiedArgs
+          of arApproved:
+            discard
+        else:
+          # No approval callback registered but needs approval - deny by default
+          wasDenied = true
+          toolResult = newToolResult("Tool execution denied (no approval handler): " & tc.name, true)
+
+      if not wasDenied:
+        toolResult = agent.registry.execute(tc.name, finalArgs)
+
       let resultMsg = newToolResultMessage(tc.id, tc.name, toolResult.text, toolResult.isError)
-      
+
       agent.messages.add(resultMsg)
       if agent.session != nil:
         agent.session.appendMessage(resultMsg)
-      
+
       callback(AgentEvent(
         kind: aekToolResult,
         resultToolCallId: tc.id,

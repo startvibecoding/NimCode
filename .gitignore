@@ -6,6 +6,7 @@ nimblecache/
 
 # Binary
 bin/nimcode
+nimcode
 
 # Test executables
 tests/test_tui

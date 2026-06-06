@@ -12,7 +12,7 @@ proc newMemory*(path: string): Memory =
   if fileExists(path):
     try:
       result.content = readFile(path)
-    except:
+    except CatchableError:
       result.content = ""
 
 proc append*(m: Memory, entry: string) =

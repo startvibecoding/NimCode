@@ -56,7 +56,7 @@ proc killJob*(jm: JobManager, id: int): bool =
     job.done = true
     job.exitCode = -1
     return true
-  except:
+  except CatchableError:
     return false
 
 proc markDone*(job: BackgroundJob, exitCode: int, stdout, stderr: string) =

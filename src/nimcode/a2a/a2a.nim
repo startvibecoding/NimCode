@@ -196,7 +196,7 @@ proc handleSendMessage(server: A2AServer, req: Request, body: JsonNode, isSse: b
     }
     try:
       await req.client.send("data: " & $startEvent & "\n\n")
-    except:
+    except CatchableError:
       return
 
     # Process task
@@ -220,7 +220,7 @@ proc handleSendMessage(server: A2AServer, req: Request, body: JsonNode, isSse: b
           }
         try:
           await req.client.send("data: " & $eventJson & "\n\n")
-        except:
+        except CatchableError:
           break
 
       finalTask.updatedAt = getTime()
@@ -234,7 +234,7 @@ proc handleSendMessage(server: A2AServer, req: Request, body: JsonNode, isSse: b
       }
       try:
         await req.client.send("data: " & $finalEvent & "\n\n")
-      except:
+      except CatchableError:
         discard
     else:
       # No handler - complete immediately
@@ -248,7 +248,7 @@ proc handleSendMessage(server: A2AServer, req: Request, body: JsonNode, isSse: b
       }
       try:
         await req.client.send("data: " & $completeEvent & "\n\n")
-      except:
+      except CatchableError:
         discard
   else:
     # Non-streaming JSON response
@@ -400,7 +400,7 @@ proc handleSubscribeSSE(server: A2AServer, req: Request) {.async.} =
     }
     try:
       await req.client.send("data: " & $eventJson & "\n\n")
-    except:
+    except CatchableError:
       return
 
   # Wait for new events
@@ -419,7 +419,7 @@ proc handleSubscribeSSE(server: A2AServer, req: Request) {.async.} =
           }
           try:
             await req.client.send("data: " & $eventJson & "\n\n")
-          except:
+          except CatchableError:
             return
       break
 
@@ -434,7 +434,7 @@ proc handleSubscribeSSE(server: A2AServer, req: Request) {.async.} =
         }
         try:
           await req.client.send("data: " & $eventJson & "\n\n")
-        except:
+        except CatchableError:
           return
       lastIdx = sub.events.len
 
@@ -547,9 +547,9 @@ proc sendTask*(serverUrl: string, task: Task, sse: bool = false): Task =
           if state != "":
             try:
               resultTask.state = parseEnum[TaskState](state)
-            except:
+            except CatchableError:
               discard
-        except:
+        except CatchableError:
           discard
 
       return resultTask

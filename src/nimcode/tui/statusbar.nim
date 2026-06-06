@@ -40,22 +40,22 @@ proc spinnerChar*(): string =
 proc buildStatusBarText*(mode, modelName, cwd: string, usagePercent: float, contextWindow: int, elapsed: float = 0, isStreaming: bool = false): string =
   var parts: seq[string] = @[]
 
-  # Mode with emoji + spinner when streaming
+  # Mode with emoji + permission hint + spinner when streaming
   let modeStr = case mode
-    of "plan": "📝 PLAN"
-    of "agent": "🤖 AGENT"
-    of "yolo": "🚀 YOLO"
+    of "plan": "📝 PLAN [RO]"
+    of "agent": "🤖 AGENT [bash:ask]"
+    of "yolo": "🚀 YOLO [auto]"
     else: "⚙️ " & mode.toUpper
   if isStreaming:
     parts.add(modeStr & " " & spinnerChar())
   else:
     parts.add(modeStr)
-  
+
   parts.add(modelName)
-  
+
   let shortDir = if cwd.len > 25: "..." & cwd[^22..^1] else: cwd
   parts.add(shortDir)
-  
+
   if contextWindow > 0:
     let percentStr = formatFloat(usagePercent, ffDecimal, 1) & "%"
     let windowStr = if contextWindow >= 1000:
@@ -63,16 +63,16 @@ proc buildStatusBarText*(mode, modelName, cwd: string, usagePercent: float, cont
     else:
       $contextWindow
     parts.add(percentStr & "/" & windowStr)
-  
+
   # Show elapsed time (live spinner during streaming, static last after done)
   if elapsed > 0:
     if isStreaming:
       parts.add(spinnerChar() & " " & formatFloat(elapsed, ffDecimal, 0) & "s")
     else:
       parts.add("last " & formatFloat(elapsed, ffDecimal, 0) & "s")
-  
+
   parts.add("Tab:mode Esc:abort Ctrl+C:exit")
-  
+
   return parts.join(" │ ")
 
 proc updateStatusBar*(state: StatusBarState) =

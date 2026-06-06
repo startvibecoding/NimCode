@@ -267,7 +267,7 @@ proc ensureProjectConfigExists*() =
   if not dirExists(dir):
     try:
       createDir(dir)
-    except:
+    except CatchableError:
       stderr.writeLine("Warning: could not create project config dir: " & getCurrentExceptionMsg())
 
 proc parseModels(modelsNode: JsonNode): seq[ModelConfig] =
@@ -421,7 +421,7 @@ proc loadSettings*(): Settings =
       let parsed = parseProviders(data)
       if parsed.len > 0:
         result.providers = parsed
-    except:
+    except CatchableError:
       stderr.writeLine("Warning: could not load global settings: " & getCurrentExceptionMsg())
 
   # Load project settings (overrides global)
@@ -442,7 +442,7 @@ proc loadSettings*(): Settings =
       if parsed.len > 0:
         for name, pc in parsed:
           result.providers[name] = pc
-    except:
+    except CatchableError:
       stderr.writeLine("Warning: could not load project settings: " & getCurrentExceptionMsg())
 
   # Environment variable overrides
