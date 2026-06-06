@@ -5,6 +5,15 @@ import ../src/nimcode/tui/tui
 import ../src/nimcode/tui/statusbar
 import ../src/nimcode/tui/format
 
+import std/unicode
+
+proc hasBraille(s: string): bool =
+  for r in s.runes:
+    let code = int(r)
+    if code >= 0x2800 and code <= 0x28FF:
+      return true
+  return false
+
 suite "Status Bar":
   test "buildStatusBarText basic format":
     let text = buildStatusBarText(
@@ -22,8 +31,8 @@ suite "Status Bar":
       10.0, 100000, 5.0, true
     )
     check ".s" in text  # Format is "5.s"
-    check "●" in text  # Streaming indicator
-  
+    check hasBraille(text)  # Streaming spinner indicator
+
   test "buildStatusBarText shows last after done":
     let text = buildStatusBarText(
       "agent", "model", "/dir",
@@ -31,7 +40,7 @@ suite "Status Bar":
     )
     check "last" in text
     check ".s" in text  # Format is "last 30.s"
-    check "●" notin text
+    check not hasBraille(text)  # No spinner when not streaming
   
   test "buildStatusBarText truncates long directory":
     let longDir = "/home/user/very/long/path/that/should/be/truncated"

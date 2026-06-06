@@ -31,17 +31,23 @@ proc getUsageInfo(agent: Agent): tuple[percent: float, window: int] =
   let window = if usage.contextWindow > 0: usage.contextWindow else: 128000
   return (percent, window)
 
+proc spinnerChar*(): string =
+  ## Return a rotating braille spinner based on current time
+  let chars = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+  let idx = int(epochTime() * 15) mod chars.len
+  return chars[idx]
+
 proc buildStatusBarText*(mode, modelName, cwd: string, usagePercent: float, contextWindow: int, elapsed: float = 0, isStreaming: bool = false): string =
   var parts: seq[string] = @[]
-  
-  # Mode with emoji
+
+  # Mode with emoji + spinner when streaming
   let modeStr = case mode
     of "plan": "📝 PLAN"
     of "agent": "🤖 AGENT"
     of "yolo": "🚀 YOLO"
     else: "⚙️ " & mode.toUpper
   if isStreaming:
-    parts.add(modeStr & " ●")
+    parts.add(modeStr & " " & spinnerChar())
   else:
     parts.add(modeStr)
   
@@ -58,10 +64,10 @@ proc buildStatusBarText*(mode, modelName, cwd: string, usagePercent: float, cont
       $contextWindow
     parts.add(percentStr & "/" & windowStr)
   
-  # Show elapsed time (live during streaming, last after done)
+  # Show elapsed time (live spinner during streaming, static last after done)
   if elapsed > 0:
     if isStreaming:
-      parts.add(formatFloat(elapsed, ffDecimal, 0) & "s")
+      parts.add(spinnerChar() & " " & formatFloat(elapsed, ffDecimal, 0) & "s")
     else:
       parts.add("last " & formatFloat(elapsed, ffDecimal, 0) & "s")
   

@@ -231,4 +231,9 @@ proc processAgentTurnStream*(agent: Agent, userMsg: string, callback: AgentEvent
         resultIsError: toolResult.isError
       ))
   
-  callback(AgentEvent(kind: aekError, errorMsg: "Max iterations exceeded"))
+  let errMsg = "Max iterations exceeded"
+  let errAssistMsg = newAssistantMessage("[Error: " & errMsg & "]")
+  agent.messages.add(errAssistMsg)
+  if agent.session != nil:
+    agent.session.appendMessage(errAssistMsg)
+  callback(AgentEvent(kind: aekError, errorMsg: errMsg))

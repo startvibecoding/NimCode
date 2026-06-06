@@ -1,11 +1,13 @@
-import std/[json, httpclient, streams, strutils, times, os, sequtils, tables]
+import std/[json, httpclient, strutils, os, tables]
 import ./types
+import ../net/streamhttp
 
 type
   OpenAiProvider* = ref object of Provider
     apiKey: string
     baseUrl: string
     client: HttpClient
+    streamClient: StreamHttpClient
     retryEnabled*: bool
     maxRetries*: int
     baseDelayMs*: int
@@ -27,6 +29,7 @@ proc newOpenAiProvider*(apiKey, baseUrl: string, retryEnabled: bool = true, maxR
     apiKey: apiKey,
     baseUrl: base,
     client: newHttpClientWithProxy(proxyUrl),
+    streamClient: newStreamHttpClient(timeout = 300_000, proxyUrl = proxyUrl),
     retryEnabled: retryEnabled,
     maxRetries: maxRetries,
     baseDelayMs: baseDelayMs,
@@ -115,124 +118,60 @@ proc thinkingFormatForModel(p: OpenAiProvider): string =
     return "xiaomi"
   return "openai"
 
-proc doChatCompletionsStream(p: OpenAiProvider, params: ChatParams, callback: StreamCallback) =
-  ## Single Chat Completions streaming attempt
-  let messages = convertMessages(params)
-  let tools = convertTools(params.tools)
-  
-  var body = %*{
-    "model": params.modelId,
-    "messages": messages,
-    "stream": true,
-    "stream_options": {"include_usage": true}
-  }
-  
-  if params.tools.len > 0 and tools.len > 0:
-    body["tools"] = tools
-  if params.maxTokens > 0:
-    body["max_tokens"] = %params.maxTokens
-  if params.temperature > 0:
-    body["temperature"] = %params.temperature
-  if params.topP > 0:
-    body["top_p"] = %params.topP
-  
-  # Thinking/reasoning support
-  if params.thinkingLevel != tlOff:
-    let format = p.thinkingFormatForModel()
-    case format
-    of "deepseek":
-      body["thinking"] = %*{"type": "enabled"}
-    of "xiaomi":
-      body["thinking"] = %*{"type": "enabled"}
-    of "openai":
-      let effort = openaiReasoningEffort(params.thinkingLevel)
-      if effort != "":
-        body["reasoning_effort"] = %effort
-    else:
-      discard
-  
-  let url = p.baseUrl & "/chat/completions"
-  var headers = newHttpHeaders([
-    ("Content-Type", "application/json"),
-    ("Authorization", "Bearer " & p.apiKey),
-    ("Accept", "text/event-stream"),
-  ])
-  
-  let response = p.client.request(url, httpMethod = HttpPost, body = $body, headers = headers)
-  
-  if response.status != "200 OK":
-    let errBody = response.body
-    callback(StreamEvent(kind: setError, error: "API error " & response.status & ": " & errBody))
-    return
-  
-  callback(StreamEvent(kind: setStart))
-  
-  # Parse SSE stream
-  let bodyStream = response.bodyStream
-  var toolCalls: seq[tuple[id, name, args: string]] = @[]
-  var toolCallBuffers: seq[string] = @[]
-  
-  while not bodyStream.atEnd:
-    let line = bodyStream.readLine()
-    
-    if not line.startsWith("data: "):
-      continue
-    
-    let data = line[6 .. ^1]
-    if data == "[DONE]":
-      break
-    
-    try:
-      let chunk = parseJson(data)
-      
-      # Usage
-      if chunk.hasKey("usage") and chunk["usage"].kind != JNull:
-        let usage = chunk["usage"]
-        callback(StreamEvent(
-          kind: setUsage,
-          inputTokens: usage{"prompt_tokens"}.getInt(0),
-          outputTokens: usage{"completion_tokens"}.getInt(0),
-          reasoningTokens: usage{"completion_tokens_details"}{"reasoning_tokens"}.getInt(0),
-        ))
-      
-      # Choices
-      if chunk.hasKey("choices") and chunk["choices"].kind == JArray:
-        for choice in chunk["choices"]:
-          if choice.hasKey("delta"):
-            let delta = choice["delta"]
-            
-            # Text content
-            if delta.hasKey("content") and delta["content"].kind != JNull:
-              let text = delta["content"].getStr("")
-              if text != "":
-                callback(StreamEvent(kind: setTextDelta, textDelta: text))
-            
-            # Reasoning/thinking content
-            if not p.disableReasoning and delta.hasKey("reasoning_content") and delta["reasoning_content"].kind != JNull:
-              let thinking = delta["reasoning_content"].getStr("")
-              if thinking != "":
-                callback(StreamEvent(kind: setThinkDelta, thinkDelta: thinking))
-            
-            # Tool calls
-            if delta.hasKey("tool_calls") and delta["tool_calls"].kind == JArray:
-              for tc in delta["tool_calls"]:
-                let idx = tc{"index"}.getInt(0)
-                while toolCalls.len <= idx:
-                  toolCalls.add(("", "", ""))
-                while toolCallBuffers.len <= idx:
-                  toolCallBuffers.add("")
-                if tc.hasKey("id") and tc["id"].kind != JNull:
-                  toolCalls[idx].id = tc["id"].getStr("")
-                if tc.hasKey("function"):
-                  let fn = tc["function"]
-                  if fn.hasKey("name") and fn["name"].kind != JNull:
-                    toolCalls[idx].name = fn["name"].getStr("")
-                  if fn.hasKey("arguments") and fn["arguments"].kind != JNull:
-                    toolCallBuffers[idx] &= fn["arguments"].getStr("")
-          
+proc parseChatCompletionsLine(p: OpenAiProvider, data: string, callback: StreamCallback,
+  toolCalls: var seq[tuple[id, name, args: string]], toolCallBuffers: var seq[string]) =
+  ## Parse a single SSE data line for chat completions
+  try:
+    let chunk = parseJson(data)
+
+    # Usage
+    if chunk.hasKey("usage") and chunk["usage"].kind != JNull:
+      let usage = chunk["usage"]
+      callback(StreamEvent(
+        kind: setUsage,
+        inputTokens: usage{"prompt_tokens"}.getInt(0),
+        outputTokens: usage{"completion_tokens"}.getInt(0),
+        reasoningTokens: usage{"completion_tokens_details"}{"reasoning_tokens"}.getInt(0),
+      ))
+
+    # Choices
+    if chunk.hasKey("choices") and chunk["choices"].kind == JArray:
+      for choice in chunk["choices"]:
+        if choice.hasKey("delta"):
+          let delta = choice["delta"]
+
+          # Text content
+          if delta.hasKey("content") and delta["content"].kind != JNull:
+            let text = delta["content"].getStr("")
+            if text != "":
+              callback(StreamEvent(kind: setTextDelta, textDelta: text))
+
+          # Reasoning/thinking content
+          if not p.disableReasoning and delta.hasKey("reasoning_content") and delta["reasoning_content"].kind != JNull:
+            let thinking = delta["reasoning_content"].getStr("")
+            if thinking != "":
+              callback(StreamEvent(kind: setThinkDelta, thinkDelta: thinking))
+
+          # Tool calls
+          if delta.hasKey("tool_calls") and delta["tool_calls"].kind == JArray:
+            for tc in delta["tool_calls"]:
+              let idx = tc{"index"}.getInt(0)
+              while toolCalls.len <= idx:
+                toolCalls.add(("", "", ""))
+              while toolCallBuffers.len <= idx:
+                toolCallBuffers.add("")
+              if tc.hasKey("id") and tc["id"].kind != JNull:
+                toolCalls[idx].id = tc{"id"}.getStr("")
+              if tc.hasKey("function"):
+                let fn = tc["function"]
+                if fn.hasKey("name") and fn["name"].kind != JNull:
+                  toolCalls[idx].name = fn{"name"}.getStr("")
+                if fn.hasKey("arguments") and fn["arguments"].kind != JNull:
+                  toolCallBuffers[idx] &= fn{"arguments"}.getStr("")
+
           # Finish reason
           if choice.hasKey("finish_reason") and choice["finish_reason"].kind != JNull:
-            let reason = choice["finish_reason"].getStr("")
+            let reason = choice{"finish_reason"}.getStr("")
             if reason == "tool_calls":
               for i, tc in toolCalls:
                 var args: JsonNode
@@ -249,10 +188,74 @@ proc doChatCompletionsStream(p: OpenAiProvider, params: ChatParams, callback: St
                 ))
               toolCalls = @[]
               toolCallBuffers = @[]
-    
-    except JsonParsingError:
-      continue
-  
+
+  except JsonParsingError:
+    discard
+
+proc doChatCompletionsStream(p: OpenAiProvider, params: ChatParams, callback: StreamCallback) =
+  ## Single Chat Completions streaming attempt using pure Nim socket streaming
+  let messages = convertMessages(params)
+  let tools = convertTools(params.tools)
+
+  var body = %*{
+    "model": params.modelId,
+    "messages": messages,
+    "stream": true,
+    "stream_options": {"include_usage": true}
+  }
+
+  if params.tools.len > 0 and tools.len > 0:
+    body["tools"] = tools
+  if params.maxTokens > 0:
+    body["max_tokens"] = %params.maxTokens
+  if params.temperature > 0:
+    body["temperature"] = %params.temperature
+  if params.topP > 0:
+    body["top_p"] = %params.topP
+
+  # Thinking/reasoning support
+  if params.thinkingLevel != tlOff:
+    let format = p.thinkingFormatForModel()
+    case format
+    of "deepseek":
+      body["thinking"] = %*{"type": "enabled"}
+    of "xiaomi":
+      body["thinking"] = %*{"type": "enabled"}
+    of "openai":
+      let effort = openaiReasoningEffort(params.thinkingLevel)
+      if effort != "":
+        body["reasoning_effort"] = %effort
+    else:
+      discard
+
+  let url = parseStreamUrl(p.baseUrl & "/chat/completions")
+  let headers: seq[(string, string)] = @[
+    ("Content-Type", "application/json"),
+    ("Authorization", "Bearer " & p.apiKey),
+    ("Accept", "text/event-stream"),
+  ]
+
+  var toolCalls: seq[tuple[id, name, args: string]] = @[]
+  var toolCallBuffers: seq[string] = @[]
+
+  callback(StreamEvent(kind: setStart))
+
+  proc onLine(line: string) =
+    if p.interruptCheck != nil and p.interruptCheck():
+      raise newException(CatchableError, "Interrupted by user")
+    if not line.startsWith("data: "):
+      return
+    let data = line[6 .. ^1]
+    if data == "[DONE]":
+      return
+    parseChatCompletionsLine(p, data, callback, toolCalls, toolCallBuffers)
+
+  let resp = p.streamClient.performRequest(url, "POST", $body, headers, onLine)
+
+  if resp.statusCode != 200:
+    callback(StreamEvent(kind: setError, error: "API error " & $resp.statusCode & ": " & resp.statusText))
+    return
+
   # Emit any remaining tool calls
   for i, tc in toolCalls:
     if i < toolCallBuffers.len and toolCallBuffers[i] != "":
@@ -263,7 +266,7 @@ proc doChatCompletionsStream(p: OpenAiProvider, params: ChatParams, callback: St
         args = newJObject()
       let id = if tc.id == "": "toolcall_" & $i else: tc.id
       callback(StreamEvent(kind: setToolCall, toolCallId: id, toolName: tc.name, toolArgs: args))
-  
+
   callback(StreamEvent(kind: setDone, stopReason: "stop"))
 
 # ---- Responses API ----
@@ -330,18 +333,90 @@ proc convertResponsesTools(tools: seq[ToolDefinition]): JsonNode =
       "parameters": t.parameters
     })
 
+proc parseResponsesLine(p: OpenAiProvider, data: string, callback: StreamCallback,
+  argumentBuffers: var Table[string, string],
+  toolCallOrder: var seq[string],
+  toolCallsByKey: var Table[string, tuple[id, name, args: string]]) =
+  ## Parse a single SSE data line for Responses API
+  try:
+    let event = parseJson(data)
+    let eventType = event{"type"}.getStr("")
+
+    case eventType
+    of "response.output_text.delta":
+      let delta = event{"delta"}.getStr("")
+      if delta != "":
+        callback(StreamEvent(kind: setTextDelta, textDelta: delta))
+
+    of "response.reasoning_text.delta":
+      let delta = event{"delta"}.getStr("")
+      if delta != "":
+        callback(StreamEvent(kind: setThinkDelta, thinkDelta: delta))
+
+    of "response.function_call_arguments.delta":
+      let itemId = event{"item_id"}.getStr("")
+      let outputIndex = event{"output_index"}.getInt(0)
+      let key = if itemId != "": itemId else: $outputIndex
+      if key notin argumentBuffers:
+        argumentBuffers[key] = ""
+      argumentBuffers[key] &= event{"delta"}.getStr("")
+
+    of "response.output_item.done":
+      let item = event{"item"}
+      if item.kind == JObject and item{"type"}.getStr("") == "function_call":
+        let itemId = item{"id"}.getStr("")
+        let outputIndex = event{"output_index"}.getInt(0)
+        let key = if itemId != "": itemId else: $outputIndex
+        var callId = item{"call_id"}.getStr("")
+        if callId == "":
+          callId = itemId
+        if callId == "":
+          callId = "toolcall_" & $toolCallOrder.len
+        let name = item{"name"}.getStr("")
+        var argsStr = item{"arguments"}.getStr("")
+        if argsStr == "" and key in argumentBuffers:
+          argsStr = argumentBuffers[key]
+        if key notin toolCallsByKey:
+          toolCallOrder.add(key)
+        toolCallsByKey[key] = (callId, name, argsStr)
+
+    of "response.completed":
+      let resp = event{"response"}
+      if resp.kind == JObject:
+        let usage = resp{"usage"}
+        if usage.kind == JObject:
+          callback(StreamEvent(
+            kind: setUsage,
+            inputTokens: usage{"input_tokens"}.getInt(0),
+            outputTokens: usage{"output_tokens"}.getInt(0),
+            reasoningTokens: usage{"output_tokens_details"}{"reasoning_tokens"}.getInt(0),
+          ))
+        let error = resp{"error"}
+        if error.kind == JObject:
+          callback(StreamEvent(kind: setError, error: "Responses error: " & error{"message"}.getStr("")))
+
+    of "response.failed", "error":
+      let errMsg = event{"error"}{"message"}.getStr("stream error")
+      callback(StreamEvent(kind: setError, error: "Responses error: " & errMsg))
+
+    else:
+      discard
+
+  except JsonParsingError:
+    discard
+
 proc doResponsesStream(p: OpenAiProvider, params: ChatParams, callback: StreamCallback) =
-  ## Single Responses API streaming attempt
+  ## Single Responses API streaming attempt using pure Nim socket streaming
   let input = convertResponsesInput(params)
   let tools = convertResponsesTools(params.tools)
-  
+
   var body = %*{
     "model": params.modelId,
     "input": input,
     "stream": true,
     "max_output_tokens": (if params.maxTokens > 0: params.maxTokens else: 16384),
   }
-  
+
   if params.systemPrompt != "":
     body["instructions"] = %params.systemPrompt
   if tools.len > 0:
@@ -350,114 +425,42 @@ proc doResponsesStream(p: OpenAiProvider, params: ChatParams, callback: StreamCa
     body["temperature"] = %params.temperature
   if params.topP > 0:
     body["top_p"] = %params.topP
-  
+
   # Thinking/reasoning support
   if params.thinkingLevel != tlOff:
     let effort = responsesReasoningEffort(params.thinkingLevel)
     if effort != "":
       body["reasoning"] = %*{"effort": effort, "summary": "auto"}
-  
-  let url = p.baseUrl & "/responses"
-  var headers = newHttpHeaders([
+
+  let url = parseStreamUrl(p.baseUrl & "/responses")
+  let headers: seq[(string, string)] = @[
     ("Content-Type", "application/json"),
     ("Authorization", "Bearer " & p.apiKey),
     ("Accept", "text/event-stream"),
-  ])
-  
-  let response = p.client.request(url, httpMethod = HttpPost, body = $body, headers = headers)
-  
-  if response.status != "200 OK":
-    let errBody = response.body
-    callback(StreamEvent(kind: setError, error: "API error " & response.status & ": " & errBody))
-    return
-  
-  callback(StreamEvent(kind: setStart))
-  
-  # Parse SSE stream
-  let bodyStream = response.bodyStream
+  ]
+
   var argumentBuffers = initTable[string, string]()
   var toolCallOrder: seq[string] = @[]
   var toolCallsByKey = initTable[string, tuple[id, name, args: string]]()
-  
-  while not bodyStream.atEnd:
-    let line = bodyStream.readLine()
-    
+
+  callback(StreamEvent(kind: setStart))
+
+  proc onLine(line: string) =
+    if p.interruptCheck != nil and p.interruptCheck():
+      raise newException(CatchableError, "Interrupted by user")
     if not line.startsWith("data: "):
-      continue
-    
+      return
     let data = line[6 .. ^1]
     if data == "[DONE]":
-      break
-    
-    try:
-      let event = parseJson(data)
-      let eventType = event{"type"}.getStr("")
-      
-      case eventType
-      of "response.output_text.delta":
-        let delta = event{"delta"}.getStr("")
-        if delta != "":
-          callback(StreamEvent(kind: setTextDelta, textDelta: delta))
-      
-      of "response.reasoning_text.delta":
-        let delta = event{"delta"}.getStr("")
-        if delta != "":
-          callback(StreamEvent(kind: setThinkDelta, thinkDelta: delta))
-      
-      of "response.function_call_arguments.delta":
-        let itemId = event{"item_id"}.getStr("")
-        let outputIndex = event{"output_index"}.getInt(0)
-        let key = if itemId != "": itemId else: $outputIndex
-        if key notin argumentBuffers:
-          argumentBuffers[key] = ""
-        argumentBuffers[key] &= event{"delta"}.getStr("")
-      
-      of "response.output_item.done":
-        let item = event{"item"}
-        if item.kind == JObject and item{"type"}.getStr("") == "function_call":
-          let itemId = item{"id"}.getStr("")
-          let outputIndex = event{"output_index"}.getInt(0)
-          let key = if itemId != "": itemId else: $outputIndex
-          var callId = item{"call_id"}.getStr("")
-          if callId == "":
-            callId = itemId
-          if callId == "":
-            callId = "toolcall_" & $toolCallOrder.len
-          let name = item{"name"}.getStr("")
-          var argsStr = item{"arguments"}.getStr("")
-          if argsStr == "" and key in argumentBuffers:
-            argsStr = argumentBuffers[key]
-          if key notin toolCallsByKey:
-            toolCallOrder.add(key)
-          toolCallsByKey[key] = (callId, name, argsStr)
-      
-      of "response.completed":
-        let resp = event{"response"}
-        if resp.kind == JObject:
-          let usage = resp{"usage"}
-          if usage.kind == JObject:
-            callback(StreamEvent(
-              kind: setUsage,
-              inputTokens: usage{"input_tokens"}.getInt(0),
-              outputTokens: usage{"output_tokens"}.getInt(0),
-              reasoningTokens: usage{"output_tokens_details"}{"reasoning_tokens"}.getInt(0),
-            ))
-          let error = resp{"error"}
-          if error.kind == JObject:
-            callback(StreamEvent(kind: setError, error: "Responses error: " & error{"message"}.getStr("")))
-            return
-      
-      of "response.failed", "error":
-        let errMsg = event{"error"}{"message"}.getStr("stream error")
-        callback(StreamEvent(kind: setError, error: "Responses error: " & errMsg))
-        return
-      
-      else:
-        discard
-    
-    except JsonParsingError:
-      continue
-  
+      return
+    parseResponsesLine(p, data, callback, argumentBuffers, toolCallOrder, toolCallsByKey)
+
+  let resp = p.streamClient.performRequest(url, "POST", $body, headers, onLine)
+
+  if resp.statusCode != 200:
+    callback(StreamEvent(kind: setError, error: "API error " & $resp.statusCode & ": " & resp.statusText))
+    return
+
   # Emit tool calls
   for key in toolCallOrder:
     if key in toolCallsByKey:
@@ -468,7 +471,7 @@ proc doResponsesStream(p: OpenAiProvider, params: ChatParams, callback: StreamCa
       except:
         args = newJObject()
       callback(StreamEvent(kind: setToolCall, toolCallId: tc.id, toolName: tc.name, toolArgs: args))
-  
+
   callback(StreamEvent(kind: setDone, stopReason: "stop"))
 
 # ---- Public API with retry ----
@@ -488,7 +491,7 @@ method chatStream*(p: OpenAiProvider, params: ChatParams, callback: StreamCallba
     except CatchableError as e:
       callback(StreamEvent(kind: setError, error: e.msg))
     return
-  
+
   var lastError = ""
   for attempt in 0 .. p.maxRetries:
     try:
@@ -503,16 +506,16 @@ method chatStream*(p: OpenAiProvider, params: ChatParams, callback: StreamCallba
           statusCode = parseInt(parts[2])
       except:
         discard
-      
+
       if not isRetryable(statusCode, lastError):
         callback(StreamEvent(kind: setError, error: lastError))
         return
-      
+
       if attempt < p.maxRetries:
         let delay = retryDelay(attempt, p.baseDelayMs)
         callback(StreamEvent(kind: setRetry, retryAttempt: attempt + 1, retryMax: p.maxRetries, retryError: lastError))
         sleep(delay)
-  
+
   callback(StreamEvent(kind: setError, error: lastError))
 
 method chat*(p: OpenAiProvider, params: ChatParams): seq[StreamEvent] =

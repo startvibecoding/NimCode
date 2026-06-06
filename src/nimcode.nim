@@ -1,7 +1,7 @@
 ## NimCode - AI coding assistant
 ## Main entry point
 
-import std/[os, strutils, parseopt, options, json, tables, sequtils, asyncdispatch, times]
+import std/[os, strutils, parseopt, options, json, tables, sequtils, asyncdispatch, times, posix, termios]
 import nimcode/config/config
 import nimcode/provider/types
 import nimcode/provider/factory
@@ -26,6 +26,29 @@ const VERSION = "0.1.2"
 
 # Global state
 var gInterruptRequested* = false
+
+proc checkEscKey(): bool =
+  ## Non-blocking check for ESC key press on stdin
+  ## Returns true if standalone ESC was pressed (not part of escape sequence)
+  var pfd: TPollfd
+  pfd.fd = 0
+  pfd.events = POLLIN
+  if poll(addr pfd, 1, 0) > 0 and (pfd.revents and POLLIN) != 0:
+    var buf: array[1, char]
+    if read(0, addr buf[0], 1) == 1:
+      if buf[0] == '\x1b':
+        # Wait briefly to distinguish standalone ESC from escape sequence
+        var pfd2: TPollfd
+        pfd2.fd = 0
+        pfd2.events = POLLIN
+        if poll(addr pfd2, 1, 50) > 0 and (pfd2.revents and POLLIN) != 0:
+          # More chars follow = escape sequence (arrow key, etc.), not ESC
+          discard tcflush(0, TCIFLUSH)
+          return false
+        return true
+      # Not ESC, flush any pending input
+      discard tcflush(0, TCIFLUSH)
+  return false
 
 proc printHelp() =
   echo "NimCode - AI coding assistant v" & VERSION
@@ -127,8 +150,8 @@ proc closeMCP*(clients: seq[MCPClient]) =
   for client in clients:
     try:
       client.close()
-    except:
-      discard
+    except CatchableError as e:
+      stderr.writeLine("Warning: MCP close failed: " & e.msg)
 
 proc run(args: seq[string], opts: var OptParser) =
   var providerName = ""
@@ -149,7 +172,7 @@ proc run(args: seq[string], opts: var OptParser) =
   var messages: seq[string] = @[]
   
   # Parse options
-  var p = initOptParser()
+  var p = opts
   while true:
     p.next()
     case p.kind
@@ -324,10 +347,15 @@ proc run(args: seq[string], opts: var OptParser) =
     sandboxLevel = settings.sandbox.level
   )
   
-  # Set interrupt check callback
+  # Set interrupt check callback (agent-level and provider-level)
   agent.interruptCheck = proc(): bool =
     return gInterruptRequested
-  
+
+  provider.interruptCheck = proc(): bool =
+    if checkEscKey():
+      gInterruptRequested = true
+    return gInterruptRequested
+
   # Reset interrupt flag
   gInterruptRequested = false
   
@@ -402,7 +430,9 @@ proc run(args: seq[string], opts: var OptParser) =
     let userMsg = messages.join(" ")
     gInterruptRequested = false
     statusBar.startTimer()
+    enableRawMode()
     agent.processAgentTurnStream(userMsg, tuiCallback)
+    disableRawMode()
     statusBar.stopTimer()
     statusBar.updateStatusBar()
   
@@ -424,11 +454,12 @@ proc run(args: seq[string], opts: var OptParser) =
       of "agent": mode = "yolo"
       of "yolo": mode = "plan"
       else: mode = "agent"
+      agent.mode = mode
       statusBar.mode = mode
       tui.addContentLine("Mode: " & mode)
       statusBar.updateStatusBar()
       continue
-    
+
     if input.strip() == "":
       continue
     
@@ -477,6 +508,7 @@ proc run(args: seq[string], opts: var OptParser) =
       continue
     elif cmd == "mode plan" or cmd == "mode agent" or cmd == "mode yolo":
       mode = cmd.split(" ")[1]
+      agent.mode = mode
       statusBar.mode = mode
       tui.addContentLine("Mode changed to: " & mode)
       statusBar.updateStatusBar()
@@ -549,6 +581,7 @@ proc run(args: seq[string], opts: var OptParser) =
       let newMode = cmd[5 .. ^1].strip
       if newMode in ["plan", "agent", "yolo"]:
         mode = newMode
+        agent.mode = mode
         statusBar.mode = mode
         tui.addContentLine("Mode changed to: " & mode)
         statusBar.updateStatusBar()
@@ -571,6 +604,7 @@ proc run(args: seq[string], opts: var OptParser) =
           let newMode = parts[1].strip
           if newMode in ["plan", "agent", "yolo"]:
             mode = newMode
+            agent.mode = mode
             statusBar.mode = mode
             tui.addContentLine("Mode changed to: " & mode)
             statusBar.updateStatusBar()
@@ -627,6 +661,7 @@ proc run(args: seq[string], opts: var OptParser) =
         of "agent": mode = "yolo"
         of "yolo": mode = "plan"
         else: mode = "agent"
+        agent.mode = mode
         statusBar.mode = mode
         tui.addContentLine("Mode changed to: " & mode)
         statusBar.updateStatusBar()
@@ -639,7 +674,9 @@ proc run(args: seq[string], opts: var OptParser) =
     
     # Process with real-time streaming
     statusBar.startTimer()
+    enableRawMode()
     agent.processAgentTurnStream(input, tuiCallback)
+    disableRawMode()
     statusBar.stopTimer()
     statusBar.updateStatusBar()
   

@@ -268,7 +268,7 @@ proc ensureProjectConfigExists*() =
     try:
       createDir(dir)
     except:
-      discard
+      stderr.writeLine("Warning: could not create project config dir: " & getCurrentExceptionMsg())
 
 proc parseModels(modelsNode: JsonNode): seq[ModelConfig] =
   result = @[]
@@ -333,7 +333,7 @@ proc loadMCPConfig*(path: string): MCPConfig =
           srv.headers.add(parseMCPHeader(hNode))
       result.servers.add(srv)
   except:
-    discard
+    stderr.writeLine("Warning: could not load MCP config from " & path & ": " & getCurrentExceptionMsg())
 
 proc loadSettings*(): Settings =
   result = defaultSettings()
@@ -422,7 +422,7 @@ proc loadSettings*(): Settings =
       if parsed.len > 0:
         result.providers = parsed
     except:
-      discard
+      stderr.writeLine("Warning: could not load global settings: " & getCurrentExceptionMsg())
 
   # Load project settings (overrides global)
   let projectPath = projectSettingsPath()
@@ -443,7 +443,7 @@ proc loadSettings*(): Settings =
         for name, pc in parsed:
           result.providers[name] = pc
     except:
-      discard
+      stderr.writeLine("Warning: could not load project settings: " & getCurrentExceptionMsg())
 
   # Environment variable overrides
   let envProvider = getEnv("NIMCODE_PROVIDER", "")

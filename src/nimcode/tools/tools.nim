@@ -55,26 +55,36 @@ proc formatWriteDiffResult(path: string, oldContent, newContent: string, bytes: 
 proc resolvePath*(workDir: string, path: string): tuple[path: string, ok: bool] =
   ## Resolves a user-provided path to an absolute path constrained to the work directory
   var resolvedPath = path
-  
+
   # Expand ~ (only ~/ prefix, not arbitrary ~user)
   if resolvedPath == "~":
     resolvedPath = getHomeDir()
   elif resolvedPath.startsWith("~/"):
     resolvedPath = getHomeDir() / resolvedPath[2 .. ^1]
-  
+
   # Convert relative paths to absolute within workDir
   if not resolvedPath.isAbsolute:
     resolvedPath = workDir / resolvedPath
-  
+
   # Clean to resolve .. segments
   resolvedPath = resolvedPath.normalizedPath
-  
+
+  # Resolve symlinks for existing paths to prevent symlink traversal
+  if fileExists(resolvedPath) or dirExists(resolvedPath):
+    try:
+      resolvedPath = expandFilename(resolvedPath)
+    except CatchableError:
+      discard
+
   # Validate: path must not escape workDir
-  let cleanWorkDir = workDir.normalizedPath
+  var cleanWorkDir = workDir.normalizedPath
+  # Strip trailing slash for consistent relativePath behavior
+  if cleanWorkDir.endsWith("/"):
+    cleanWorkDir = cleanWorkDir[0 .. ^2]
   let rel = resolvedPath.relativePath(cleanWorkDir)
   if rel == ".." or rel.startsWith(".."):
     return ("", false)
-  
+
   return (resolvedPath, true)
 
 # Plan Tool
@@ -301,7 +311,7 @@ proc executeEdit(tool: Tool, params: JsonNode): ToolResult =
   
   # New format: edits[] array
   let editsRaw = params{"edits"}
-  if editsRaw.kind == JArray and editsRaw.len > 0:
+  if editsRaw != nil and editsRaw.kind == JArray and editsRaw.len > 0:
     for i in 0 ..< editsRaw.len:
       let e = editsRaw[i]
       let ot = e{"oldText"}.getStr("")
@@ -467,22 +477,36 @@ proc executeGrep(tool: Tool, params: JsonNode): ToolResult =
   let maxResults = params{"maxResults"}.getInt(100)
   
   try:
-    var cmd = "grep -rn"
+    var args = @["-rn"]
     if includePattern != "":
-      # Use --include for file pattern filtering
-      cmd.add(" --include=\"" & includePattern & "\"")
-    cmd.add(" \"" & pattern & "\" " & fullPath)
-    cmd.add(" 2>/dev/null | head -" & $maxResults)
-    let (output, exitCode) = execCmdEx(cmd)
-    
+      args.add("--include=" & includePattern)
+    args.add("--")
+    args.add(pattern)
+    args.add(fullPath)
+
+    let process = startProcess(
+      "grep",
+      args = args,
+      options = {poStdErrToStdOut, poUsePath},
+      workingDir = tool.workDir
+    )
+    var output = process.outputStream().readAll()
+    let exitCode = process.waitForExit()
+    process.close()
+
     if exitCode != 0 and output.len == 0:
       return newToolResult("No matches found")
-    
-    var result = output
-    if result.len > 50000:
-      result = result[0 ..< 50000] & "\n... (truncated)"
-    
-    return newToolResult(result)
+
+    # Truncate to maxResults lines
+    var lines = output.splitLines()
+    if lines.len > maxResults:
+      lines = lines[0 ..< maxResults]
+      output = lines.join("\n")
+
+    if output.len > 50000:
+      output = output[0 ..< 50000] & "\n... (truncated)"
+
+    return newToolResult(output)
   except CatchableError as e:
     return newToolResult("Error searching: " & e.msg, true)
 
@@ -511,17 +535,29 @@ proc executeFind(tool: Tool, params: JsonNode): ToolResult =
   let maxResults = params{"maxResults"}.getInt(200)
   
   try:
-    let cmd = "find " & fullPath & " -name \"" & pattern & "\" 2>/dev/null | head -" & $maxResults
-    let (output, exitCode) = execCmdEx(cmd)
-    
+    let process = startProcess(
+      "find",
+      args = @["-L", fullPath, "-name", pattern],
+      options = {poStdErrToStdOut, poUsePath},
+      workingDir = tool.workDir
+    )
+    var output = process.outputStream().readAll()
+    let exitCode = process.waitForExit()
+    process.close()
+
     if output.len == 0:
       return newToolResult("No files found matching: " & pattern)
-    
-    var result = output
-    if result.len > 50000:
-      result = result[0 ..< 50000] & "\n... (truncated)"
-    
-    return newToolResult(result)
+
+    # Truncate to maxResults lines
+    var lines = output.splitLines()
+    if lines.len > maxResults:
+      lines = lines[0 ..< maxResults]
+      output = lines.join("\n")
+
+    if output.len > 50000:
+      output = output[0 ..< 50000] & "\n... (truncated)"
+
+    return newToolResult(output)
   except CatchableError as e:
     return newToolResult("Error finding files: " & e.msg, true)
 
@@ -629,7 +665,15 @@ proc executeSpawn(tool: Tool, params: JsonNode): ToolResult =
   # Execute sub-agent via nimcode CLI
   let args = @["-M", subMode, "-P", prompt]
   try:
-    let (output, exitCode) = execCmdEx("nimcode " & args.mapIt("'" & it & "'").join(" "))
+    let process = startProcess(
+      getAppFilename(),
+      args = args,
+      options = {poStdErrToStdOut, poUsePath},
+      workingDir = subWorkDir
+    )
+    let output = process.outputStream().readAll()
+    let exitCode = process.waitForExit()
+    process.close()
     if exitCode == 0:
       return newToolResult(output.strip())
     else:

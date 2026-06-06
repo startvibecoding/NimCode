@@ -1,7 +1,7 @@
 ## Stream callbacks for NimCode CLI
 ## Handles TUI and print mode output
 
-import std/[json]
+import std/[json, times]
 import ../agent/agent
 import ../tui/tui
 import ../tui/statusbar
@@ -18,6 +18,7 @@ type
     # Track output state
     assistantStarted*: bool
     thinkStarted*: bool
+    lastRenderTime*: float  ## Throttle TUI renders to avoid flicker
 
 proc newStreamCallbackState*(mode: StreamCallbackMode, tui: TuiState = nil, statusBar: StatusBarState = nil): StreamCallbackState =
   result = StreamCallbackState(
@@ -26,7 +27,21 @@ proc newStreamCallbackState*(mode: StreamCallbackMode, tui: TuiState = nil, stat
     statusBar: statusBar,
     assistantStarted: false,
     thinkStarted: false,
+    lastRenderTime: 0,
   )
+
+proc shouldRender(state: StreamCallbackState): bool =
+  ## Throttle renders to ~50ms to avoid overwhelming the terminal
+  ## when tokens arrive faster than the display can refresh
+  let now = epochTime()
+  if now - state.lastRenderTime > 0.05:
+    state.lastRenderTime = now
+    return true
+  return false
+
+proc forceRender(state: StreamCallbackState) =
+  state.lastRenderTime = epochTime()
+  state.statusBar.updateStatusBar()
 
 proc tuiStreamCallback*(state: StreamCallbackState, event: AgentEvent) =
   ## TUI mode callback - renders to fixed bottom layout
@@ -43,8 +58,9 @@ proc tuiStreamCallback*(state: StreamCallbackState, event: AgentEvent) =
     else:
       if state.tui.contentLines.len > 0:
         state.tui.contentLines[^1].add(event.textDelta)
-    state.statusBar.updateStatusBar()
-  
+    if shouldRender(state):
+      state.statusBar.updateStatusBar()
+
   of aekThinkDelta:
     if not state.thinkStarted:
       if state.assistantStarted:
@@ -57,16 +73,17 @@ proc tuiStreamCallback*(state: StreamCallbackState, event: AgentEvent) =
     else:
       if state.tui.contentLines.len > 0:
         state.tui.contentLines[^1].add(event.thinkDelta)
-    state.statusBar.updateStatusBar()
-  
+    if shouldRender(state):
+      state.statusBar.updateStatusBar()
+
   of aekToolCall:
     state.assistantStarted = false
     state.thinkStarted = false
     state.tui.addContentLine("")
     state.tui.addContentLine(">> " & event.toolName & " " & $event.toolArgs)
     state.tui.addContentLine("")
-    state.statusBar.updateStatusBar()
-  
+    forceRender(state)
+
   of aekToolResult:
     let preview = if event.resultText.len > 100: event.resultText[0 ..< 100] & "..." else: event.resultText
     if event.resultIsError:
@@ -74,22 +91,22 @@ proc tuiStreamCallback*(state: StreamCallbackState, event: AgentEvent) =
     else:
       state.tui.addContentLine("<< " & event.resultToolName & " " & preview)
     state.tui.addContentLine("")
-    state.statusBar.updateStatusBar()
-  
+    forceRender(state)
+
   of aekError:
     state.assistantStarted = false
     state.thinkStarted = false
     state.statusBar.stopTimer()
     state.tui.addContentLine("Error: " & event.errorMsg)
     state.tui.addContentLine("")
-    state.statusBar.updateStatusBar()
-  
+    forceRender(state)
+
   of aekDone:
     state.assistantStarted = false
     state.thinkStarted = false
     state.statusBar.stopTimer()
     state.tui.addContentLine("")
-    state.statusBar.updateStatusBar()
+    forceRender(state)
 
 proc printStreamCallback*(state: StreamCallbackState, event: AgentEvent) =
   ## Print mode callback - simple stdout output for -P flag
@@ -103,7 +120,7 @@ proc printStreamCallback*(state: StreamCallbackState, event: AgentEvent) =
       state.assistantStarted = true
     stdout.write(event.textDelta)
     stdout.flushFile()
-  
+
   of aekThinkDelta:
     if not state.thinkStarted:
       if state.assistantStarted:
@@ -113,13 +130,13 @@ proc printStreamCallback*(state: StreamCallbackState, event: AgentEvent) =
       state.thinkStarted = true
     stdout.write(event.thinkDelta)
     stdout.flushFile()
-  
+
   of aekToolCall:
     state.assistantStarted = false
     state.thinkStarted = false
     stdout.write("\n>> " & event.toolName & " " & $event.toolArgs & "\n")
     stdout.flushFile()
-  
+
   of aekToolResult:
     let preview = if event.resultText.len > 200: event.resultText[0 ..< 200] & "..." else: event.resultText
     if event.resultIsError:
@@ -127,13 +144,13 @@ proc printStreamCallback*(state: StreamCallbackState, event: AgentEvent) =
     else:
       stdout.write("<< " & event.resultToolName & " " & preview & "\n")
     stdout.flushFile()
-  
+
   of aekError:
     state.assistantStarted = false
     state.thinkStarted = false
     stderr.writeLine("\nError: " & event.errorMsg)
     stderr.flushFile()
-  
+
   of aekDone:
     state.assistantStarted = false
     state.thinkStarted = false

@@ -45,7 +45,7 @@ proc newCronStore*(path: string): CronStore =
           job.lastError = j{"lastError"}.getStr("")
           result.jobs.add(job)
     except:
-      discard
+      stderr.writeLine("Warning: could not load cron jobs: " & getCurrentExceptionMsg())
 
 proc save(store: CronStore) =
   ## Persist jobs to disk
@@ -67,7 +67,7 @@ proc save(store: CronStore) =
     createDir(store.path.parentDir())
     writeFile(store.path, arr.pretty())
   except:
-    discard
+    stderr.writeLine("Warning: could not save cron jobs: " & getCurrentExceptionMsg())
 
 proc generateId(): string =
   ## Generate a short random ID
@@ -199,14 +199,18 @@ proc parseScheduleNext*(schedule: string, fromTime: Time): Time =
   elif lower.startsWith("@every "):
     let durationStr = lower[7 .. ^1].strip
     var seconds = 0
-    if durationStr.endsWith("m"):
-      seconds = parseInt(durationStr[0 .. ^2]) * 60
-    elif durationStr.endsWith("h"):
-      seconds = parseInt(durationStr[0 .. ^2]) * 3600
-    elif durationStr.endsWith("s"):
-      seconds = parseInt(durationStr[0 .. ^2])
-    else:
-      seconds = parseInt(durationStr)
+    try:
+      if durationStr.endsWith("m"):
+        seconds = parseInt(durationStr[0 .. ^2]) * 60
+      elif durationStr.endsWith("h"):
+        seconds = parseInt(durationStr[0 .. ^2]) * 3600
+      elif durationStr.endsWith("s"):
+        seconds = parseInt(durationStr[0 .. ^2])
+      else:
+        seconds = parseInt(durationStr)
+    except ValueError:
+      stderr.writeLine("Warning: invalid cron schedule duration: " & durationStr)
+      seconds = 0
     if seconds > 0:
       return fromTime + initDuration(seconds = seconds)
   # Default: 1 hour
@@ -233,10 +237,17 @@ proc executeCronJob(scheduler: CronScheduler, job: CronJob) =
   scheduler.store.markRun(job.id, "running")
   
   try:
-    let modeFlag = if job.mode == "yolo": "-M yolo" else: "-M agent"
-    let cmd = scheduler.nimcodeBin & " " & modeFlag & " -P \"" & job.prompt & "\""
-    let (output, exitCode) = execCmdEx(cmd, workingDir = scheduler.workDir)
-    
+    let args = @["-M", job.mode, "-P", job.prompt]
+    let process = startProcess(
+      scheduler.nimcodeBin,
+      args = args,
+      options = {poStdErrToStdOut, poUsePath},
+      workingDir = scheduler.workDir
+    )
+    let output = process.outputStream().readAll()
+    let exitCode = process.waitForExit()
+    process.close()
+
     if exitCode == 0:
       scheduler.store.markRun(job.id, "success")
       stderr.writeLine("Cron: Job '" & job.name & "' completed successfully")

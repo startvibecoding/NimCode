@@ -66,7 +66,7 @@ proc readResponse(client: MCPClient, timeout: int = 15000): MCPResponse =
       return
     except JsonParsingError:
       continue
-    except:
+    except CatchableError:
       if client.closed:
         raise newException(CatchableError, "MCP client closed")
       sleep(10)
@@ -200,12 +200,12 @@ proc close*(client: MCPClient) =
   client.closed = true
   try:
     client.process.terminate()
-  except:
-    discard
+  except CatchableError as e:
+    stderr.writeLine("Warning: MCP process terminate failed: " & e.msg)
   try:
     client.process.close()
-  except:
-    discard
+  except CatchableError as e:
+    stderr.writeLine("Warning: MCP process close failed: " & e.msg)
 
 proc isConnected*(client: MCPClient): bool =
   ## Check if the MCP client is still connected

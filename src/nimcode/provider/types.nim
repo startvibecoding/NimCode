@@ -118,6 +118,7 @@ type
 
   Provider* = ref object of RootObj
     name*: string
+    interruptCheck*: proc(): bool {.closure.}  ## Called during SSE streaming to check for user interrupt
 
   ## Retry configuration shared across providers
   RetryConfig* = object

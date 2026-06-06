@@ -1,26 +1,23 @@
-import std/[json, httpclient, streams, strutils, sequtils, options, times, os]
+import std/[json, strutils, os]
 import ./types
+import ../net/streamhttp
 
 type
   GoogleGeminiProvider* = ref object of Provider
     apiKey: string
     baseUrl: string
-    client: HttpClient
+    streamClient: StreamHttpClient
     retryEnabled*: bool
     maxRetries*: int
     baseDelayMs*: int
 
 proc newGoogleGeminiProvider*(apiKey, baseUrl: string, retryEnabled: bool = true, maxRetries: int = 3, baseDelayMs: int = 2000, proxyUrl: string = ""): GoogleGeminiProvider =
   let defaultBaseUrl = "https://generativelanguage.googleapis.com/v1beta/models"
-  let client = if proxyUrl.strip() != "":
-    newHttpClient(timeout = 300_000, proxy = newProxy(proxyUrl.strip()))
-  else:
-    newHttpClient(timeout = 300_000)
   result = GoogleGeminiProvider(
     name: "google-gemini",
     apiKey: apiKey,
     baseUrl: if baseUrl == "": defaultBaseUrl else: baseUrl.strip(chars = {'/'}),
-    client: client,
+    streamClient: newStreamHttpClient(timeout = 300_000, proxyUrl = proxyUrl),
     retryEnabled: retryEnabled,
     maxRetries: maxRetries,
     baseDelayMs: baseDelayMs,
@@ -45,10 +42,10 @@ proc convertMessages(params: ChatParams): tuple[system: string, contents: JsonNo
   ## Convert messages to Google Gemini format
   var systemParts: seq[string] = @[]
   var contents = newJArray()
-  
+
   if params.systemPrompt != "":
     systemParts.add(params.systemPrompt)
-  
+
   for msg in params.messages:
     var jmsg = newJObject()
     case msg.role
@@ -86,7 +83,7 @@ proc convertMessages(params: ChatParams): tuple[system: string, contents: JsonNo
         }
       }]
     contents.add(jmsg)
-  
+
   return (systemParts.join("\n"), contents)
 
 proc convertTools(tools: seq[ToolDefinition]): JsonNode =
@@ -103,24 +100,73 @@ proc convertTools(tools: seq[ToolDefinition]): JsonNode =
     return newJArray()
   result = %*[{"function_declarations": decls}]
 
+proc parseGeminiLine(data: string, callback: StreamCallback,
+  toolCalls: var seq[tuple[id, name, args: string]],
+  toolCallBuffers: var seq[string]) =
+  ## Parse a single SSE data line for Google Gemini
+  try:
+    let chunk = parseJson(data)
+
+    # Usage metadata
+    if chunk.hasKey("usageMetadata") and chunk["usageMetadata"].kind == JObject:
+      let usage = chunk["usageMetadata"]
+      callback(StreamEvent(
+        kind: setUsage,
+        inputTokens: usage{"promptTokenCount"}.getInt(0),
+        outputTokens: usage{"candidatesTokenCount"}.getInt(0),
+        reasoningTokens: usage{"thoughtsTokenCount"}.getInt(0),
+      ))
+
+    # Candidates
+    if chunk.hasKey("candidates") and chunk["candidates"].kind == JArray:
+      for candidate in chunk["candidates"]:
+        if candidate.hasKey("content") and candidate["content"].kind == JObject:
+          let content = candidate["content"]
+          if content.hasKey("parts") and content["parts"].kind == JArray:
+            for part in content["parts"]:
+              # Text content (skip thoughts)
+              if part.hasKey("text"):
+                let text = part{"text"}.getStr("")
+                if text != "":
+                  if part.hasKey("thought") and part["thought"].getBool(false):
+                    callback(StreamEvent(kind: setThinkDelta, thinkDelta: text))
+                  else:
+                    callback(StreamEvent(kind: setTextDelta, textDelta: text))
+
+              # Function call
+              if part.hasKey("functionCall") and part["functionCall"].kind == JObject:
+                let fc = part["functionCall"]
+                let name = fc{"name"}.getStr("")
+                let argsNode = fc{"args"}
+                let argsStr = if argsNode.kind != JNull: $argsNode else: ""
+                toolCalls.add(("", name, ""))
+                toolCallBuffers.add(argsStr)
+
+        # Tool calls can also be surfaced at candidate level on finish
+        if candidate.hasKey("finishReason") and candidate{"finishReason"}.getStr("") != "":
+          discard
+
+  except JsonParsingError:
+    discard
+
 proc doChatStream(p: GoogleGeminiProvider, params: ChatParams, callback: StreamCallback) =
-  ## Single streaming attempt
+  ## Single streaming attempt using pure Nim socket streaming
   let (system, contents) = convertMessages(params)
   let tools = convertTools(params.tools)
-  
+
   var body = %*{
     "contents": contents,
     "generationConfig": {
       "maxOutputTokens": (if params.maxTokens > 0: params.maxTokens else: 8192)
     }
   }
-  
+
   if system != "":
     body["systemInstruction"] = %*{"parts": [{"text": system}]}
-  
+
   if params.tools.len > 0 and tools.len > 0:
     body["tools"] = tools
-  
+
   # Thinking/reasoning support (Gemini 2.5 thinking models)
   if params.thinkingLevel != tlOff:
     let thinkingConfig = case params.thinkingLevel
@@ -133,86 +179,41 @@ proc doChatStream(p: GoogleGeminiProvider, params: ChatParams, callback: StreamC
     body["generationConfig"]["thinkingConfig"] = %*{
       "thinkingBudget": thinkingConfig
     }
-  
-  let url = p.baseUrl & "/" & params.modelId & ":streamGenerateContent?key=" & p.apiKey & "&alt=sse"
-  
-  var headers = newHttpHeaders([
+
+  let url = parseStreamUrl(p.baseUrl & "/" & params.modelId & ":streamGenerateContent?key=" & p.apiKey & "&alt=sse")
+  let headers: seq[(string, string)] = @[
     ("Content-Type", "application/json"),
-  ])
-  
-  let response = p.client.request(url, httpMethod = HttpPost, body = $body, headers = headers)
-  
-  if response.status != "200 OK":
-    let errBody = response.body
-    callback(StreamEvent(kind: setError, error: "API error " & response.status & ": " & errBody))
-    return
-  
-  callback(StreamEvent(kind: setStart))
-  
-  # Parse SSE stream
-  let bodyStream = response.bodyStream
+  ]
+
   var toolCalls: seq[tuple[id, name, args: string]] = @[]
-  
-  while not bodyStream.atEnd:
-    let line = bodyStream.readLine()
-    
+  var toolCallBuffers: seq[string] = @[]
+
+  callback(StreamEvent(kind: setStart))
+
+  proc onLine(line: string) =
+    if p.interruptCheck != nil and p.interruptCheck():
+      raise newException(CatchableError, "Interrupted by user")
     if not line.startsWith("data: "):
-      continue
-    
+      return
     let data = line[6 .. ^1]
-    
-    try:
-      let chunk = parseJson(data)
-      
-      # Parse candidates
-      if chunk.hasKey("candidates") and chunk["candidates"].kind == JArray:
-        for candidate in chunk["candidates"]:
-          if candidate.hasKey("content"):
-            let content = candidate["content"]
-            if content.hasKey("parts") and content["parts"].kind == JArray:
-              for part in content["parts"]:
-                # Text content
-                if part.hasKey("text"):
-                  let text = part["text"].getStr("")
-                  if text != "":
-                    callback(StreamEvent(kind: setTextDelta, textDelta: text))
-                
-                # Thinking/reasoning content
-                if part.hasKey("thought") and part["thought"].getBool(false):
-                  let text = part{"text"}.getStr("")
-                  if text != "":
-                    callback(StreamEvent(kind: setThinkDelta, thinkDelta: text))
-                
-                # Function call
-                if part.hasKey("functionCall"):
-                  let fc = part["functionCall"]
-                  let name = fc{"name"}.getStr("")
-                  let args = fc{"args"}
-                  toolCalls.add(("", name, $args))
-      
-      # Usage metadata
-      if chunk.hasKey("usageMetadata"):
-        let usage = chunk["usageMetadata"]
-        callback(StreamEvent(
-          kind: setUsage,
-          inputTokens: usage{"promptTokenCount"}.getInt(0),
-          outputTokens: usage{"candidatesTokenCount"}.getInt(0),
-          reasoningTokens: usage{"thoughtsTokenCount"}.getInt(0),
-        ))
-    
-    except JsonParsingError:
-      continue
-  
+    parseGeminiLine(data, callback, toolCalls, toolCallBuffers)
+
+  let resp = p.streamClient.performRequest(url, "POST", $body, headers, onLine)
+
+  if resp.statusCode != 200:
+    callback(StreamEvent(kind: setError, error: "API error " & $resp.statusCode & ": " & resp.statusText))
+    return
+
   # Emit tool calls
   for i, tc in toolCalls:
     var args: JsonNode
     try:
-      args = parseJson(tc.args)
+      args = parseJson(toolCallBuffers[i])
     except:
       args = newJObject()
     let id = if tc.id == "": "toolcall_" & $i else: tc.id
     callback(StreamEvent(kind: setToolCall, toolCallId: id, toolName: tc.name, toolArgs: args))
-  
+
   callback(StreamEvent(kind: setDone, stopReason: "stop"))
 
 method chatStream*(p: GoogleGeminiProvider, params: ChatParams, callback: StreamCallback) =
@@ -223,7 +224,7 @@ method chatStream*(p: GoogleGeminiProvider, params: ChatParams, callback: Stream
     except CatchableError as e:
       callback(StreamEvent(kind: setError, error: e.msg))
     return
-  
+
   var lastError = ""
   for attempt in 0 .. p.maxRetries:
     try:
@@ -238,16 +239,16 @@ method chatStream*(p: GoogleGeminiProvider, params: ChatParams, callback: Stream
           statusCode = parseInt(parts[2])
       except:
         discard
-      
+
       if not isRetryable(statusCode, lastError):
         callback(StreamEvent(kind: setError, error: lastError))
         return
-      
+
       if attempt < p.maxRetries:
         let delay = retryDelay(attempt, p.baseDelayMs)
         callback(StreamEvent(kind: setRetry, retryAttempt: attempt + 1, retryMax: p.maxRetries, retryError: lastError))
         sleep(delay)
-  
+
   callback(StreamEvent(kind: setError, error: lastError))
 
 method chat*(p: GoogleGeminiProvider, params: ChatParams): seq[StreamEvent] =

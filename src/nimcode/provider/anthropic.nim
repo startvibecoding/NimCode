@@ -1,11 +1,13 @@
-import std/[json, httpclient, streams, strutils, sequtils, options, times, os]
+import std/[json, httpclient, strutils, os]
 import ./types
+import ../net/streamhttp
 
 type
   AnthropicProvider* = ref object of Provider
     apiKey: string
     baseUrl: string
     client: HttpClient
+    streamClient: StreamHttpClient
     retryEnabled*: bool
     maxRetries*: int
     baseDelayMs*: int
@@ -23,6 +25,7 @@ proc newAnthropicProvider*(apiKey, baseUrl: string, retryEnabled: bool = true, m
     apiKey: apiKey,
     baseUrl: base,
     client: client,
+    streamClient: newStreamHttpClient(timeout = 300_000, proxyUrl = proxyUrl),
     retryEnabled: retryEnabled,
     maxRetries: maxRetries,
     baseDelayMs: baseDelayMs,
@@ -133,18 +136,118 @@ proc convertTools(tools: seq[ToolDefinition]): JsonNode =
       "input_schema": t.parameters
     })
 
+proc parseAnthropicLine(p: AnthropicProvider, data: string, callback: StreamCallback,
+  toolCallIdx: var int,
+  toolCalls: var seq[tuple[id, name, args: string]],
+  toolCallBuffers: var seq[string],
+  currentBlockType: var string,
+  thinkingSignature: var string) =
+  ## Parse a single SSE data line for Anthropic
+  try:
+    let event = parseJson(data)
+    let eventType = event{"type"}.getStr("")
+
+    case eventType
+    of "message_start":
+      let message = event{"message"}
+      if message.kind == JObject:
+        let usage = message{"usage"}
+        if usage.kind == JObject:
+          callback(StreamEvent(
+            kind: setUsage,
+            inputTokens: usage{"input_tokens"}.getInt(0),
+            outputTokens: usage{"output_tokens"}.getInt(0),
+            cacheReadTokens: usage{"cache_read_input_tokens"}.getInt(0),
+            cacheWriteTokens: usage{"cache_creation_input_tokens"}.getInt(0),
+          ))
+
+    of "content_block_start":
+      let contentBlock = event{"content_block"}
+      if contentBlock.kind == JObject:
+        let blockType = contentBlock{"type"}.getStr("")
+        currentBlockType = blockType
+        if blockType == "tool_use":
+          toolCallIdx = toolCalls.len
+          toolCalls.add((
+            contentBlock{"id"}.getStr(""),
+            contentBlock{"name"}.getStr(""),
+            ""
+          ))
+          toolCallBuffers.add("")
+
+    of "content_block_delta":
+      let delta = event{"delta"}
+      if delta.kind == JObject:
+        let deltaType = delta{"type"}.getStr("")
+        case deltaType
+        of "text_delta":
+          let text = delta{"text"}.getStr("")
+          if text != "":
+            callback(StreamEvent(kind: setTextDelta, textDelta: text))
+        of "thinking_delta":
+          let thinking = delta{"thinking"}.getStr("")
+          if thinking != "":
+            callback(StreamEvent(kind: setThinkDelta, thinkDelta: thinking))
+        of "signature_delta":
+          thinkingSignature &= delta{"signature"}.getStr("")
+        of "input_json_delta":
+          if toolCallIdx >= 0 and toolCallIdx < toolCallBuffers.len:
+            toolCallBuffers[toolCallIdx] &= delta{"partial_json"}.getStr("")
+        else:
+          discard
+
+    of "content_block_stop":
+      if currentBlockType == "tool_use" and toolCallIdx >= 0 and toolCallIdx < toolCalls.len:
+        var args: JsonNode
+        try:
+          args = parseJson(toolCallBuffers[toolCallIdx])
+        except:
+          args = newJObject()
+        callback(StreamEvent(kind: setToolCall, toolCallId: toolCalls[toolCallIdx].id, toolName: toolCalls[toolCallIdx].name, toolArgs: args))
+      toolCallIdx = -1
+      currentBlockType = ""
+
+    of "message_delta":
+      let delta = event{"delta"}
+      if delta.kind == JObject and delta.hasKey("stop_reason"):
+        discard  # stop_reason handled at stream end
+      let usage = event{"usage"}
+      if usage.kind == JObject:
+        callback(StreamEvent(
+          kind: setUsage,
+          inputTokens: 0,
+          outputTokens: usage{"output_tokens"}.getInt(0),
+        ))
+
+    of "message_stop":
+      discard
+
+    of "ping":
+      discard
+
+    of "error":
+      let errMsg = event{"error"}{"message"}.getStr("stream error")
+      let errType = event{"error"}{"type"}.getStr("")
+      callback(StreamEvent(kind: setError, error: (if errType != "": errType & ": " else: "") & errMsg))
+
+    else:
+      discard
+
+  except JsonParsingError:
+    discard
+
 proc doChatStream(p: AnthropicProvider, params: ChatParams, callback: StreamCallback) =
-  ## Single streaming attempt
+  ## Single streaming attempt using pure Nim socket streaming
   let messages = convertMessages(params, p.cacheControlEnabled)
   let tools = convertTools(params.tools)
-  
+
   var body = %*{
     "model": params.modelId,
     "messages": messages,
     "max_tokens": (if params.maxTokens > 0: params.maxTokens else: 8192),
     "stream": true
   }
-  
+
   # System prompt
   if params.systemPrompt != "":
     if p.cacheControlEnabled:
@@ -155,14 +258,14 @@ proc doChatStream(p: AnthropicProvider, params: ChatParams, callback: StreamCall
       }]
     else:
       body["system"] = %params.systemPrompt
-  
+
   if params.tools.len > 0:
     body["tools"] = tools
   if params.temperature > 0:
     body["temperature"] = %params.temperature
   if params.topP > 0:
     body["top_p"] = %params.topP
-  
+
   # Thinking/reasoning (extended thinking)
   if params.thinkingLevel != tlOff:
     let format = p.thinkingFormatForModel()
@@ -175,134 +278,37 @@ proc doChatStream(p: AnthropicProvider, params: ChatParams, callback: StreamCall
       # Extended thinking requires higher max_tokens
       if params.maxTokens <= budget:
         body["max_tokens"] = %(budget + 4096)
-  
-  let url = p.baseUrl & "/v1/messages"
-  var headers = newHttpHeaders([
+
+  let url = parseStreamUrl(p.baseUrl & "/v1/messages")
+  let headers: seq[(string, string)] = @[
     ("Content-Type", "application/json"),
     ("x-api-key", p.apiKey),
     ("anthropic-version", "2023-06-01"),
     ("Accept", "text/event-stream"),
-  ])
-  
-  let response = p.client.request(url, httpMethod = HttpPost, body = $body, headers = headers)
-  
-  if response.status != "200 OK":
-    let errBody = response.body
-    callback(StreamEvent(kind: setError, error: "API error " & response.status & ": " & errBody))
-    return
-  
-  callback(StreamEvent(kind: setStart))
-  
-  # Parse SSE stream
-  let bodyStream = response.bodyStream
+  ]
+
   var toolCallIdx = -1
   var toolCalls: seq[tuple[id, name, args: string]] = @[]
   var toolCallBuffers: seq[string] = @[]
   var currentBlockType = ""
   var thinkingSignature = ""
-  
-  while not bodyStream.atEnd:
-    let line = bodyStream.readLine()
-    
+
+  callback(StreamEvent(kind: setStart))
+
+  proc onLine(line: string) =
+    if p.interruptCheck != nil and p.interruptCheck():
+      raise newException(CatchableError, "Interrupted by user")
     if not line.startsWith("data: "):
-      continue
-    
+      return
     let data = line[6 .. ^1]
-    
-    try:
-      let event = parseJson(data)
-      let eventType = event{"type"}.getStr("")
-      
-      case eventType
-      of "message_start":
-        let message = event{"message"}
-        if message.kind == JObject:
-          let usage = message{"usage"}
-          if usage.kind == JObject:
-            callback(StreamEvent(
-              kind: setUsage,
-              inputTokens: usage{"input_tokens"}.getInt(0),
-              outputTokens: usage{"output_tokens"}.getInt(0),
-              cacheReadTokens: usage{"cache_read_input_tokens"}.getInt(0),
-              cacheWriteTokens: usage{"cache_creation_input_tokens"}.getInt(0),
-            ))
-      
-      of "content_block_start":
-        let contentBlock = event{"content_block"}
-        if contentBlock.kind == JObject:
-          let blockType = contentBlock{"type"}.getStr("")
-          currentBlockType = blockType
-          if blockType == "tool_use":
-            toolCallIdx = toolCalls.len
-            toolCalls.add((
-              contentBlock{"id"}.getStr(""),
-              contentBlock{"name"}.getStr(""),
-              ""
-            ))
-            toolCallBuffers.add("")
-      
-      of "content_block_delta":
-        let delta = event{"delta"}
-        if delta.kind == JObject:
-          let deltaType = delta{"type"}.getStr("")
-          case deltaType
-          of "text_delta":
-            let text = delta{"text"}.getStr("")
-            if text != "":
-              callback(StreamEvent(kind: setTextDelta, textDelta: text))
-          of "thinking_delta":
-            let thinking = delta{"thinking"}.getStr("")
-            if thinking != "":
-              callback(StreamEvent(kind: setThinkDelta, thinkDelta: thinking))
-          of "signature_delta":
-            thinkingSignature &= delta{"signature"}.getStr("")
-          of "input_json_delta":
-            if toolCallIdx >= 0 and toolCallIdx < toolCallBuffers.len:
-              toolCallBuffers[toolCallIdx] &= delta{"partial_json"}.getStr("")
-          else:
-            discard
-      
-      of "content_block_stop":
-        if currentBlockType == "tool_use" and toolCallIdx >= 0 and toolCallIdx < toolCalls.len:
-          var args: JsonNode
-          try:
-            args = parseJson(toolCallBuffers[toolCallIdx])
-          except:
-            args = newJObject()
-          callback(StreamEvent(kind: setToolCall, toolCallId: toolCalls[toolCallIdx].id, toolName: toolCalls[toolCallIdx].name, toolArgs: args))
-        toolCallIdx = -1
-        currentBlockType = ""
-      
-      of "message_delta":
-        let delta = event{"delta"}
-        if delta.kind == JObject and delta.hasKey("stop_reason"):
-          discard  # stop_reason handled at stream end
-        let usage = event{"usage"}
-        if usage.kind == JObject:
-          callback(StreamEvent(
-            kind: setUsage,
-            inputTokens: 0,
-            outputTokens: usage{"output_tokens"}.getInt(0),
-          ))
-      
-      of "message_stop":
-        discard
-      
-      of "ping":
-        discard
-      
-      of "error":
-        let errMsg = event{"error"}{"message"}.getStr("stream error")
-        let errType = event{"error"}{"type"}.getStr("")
-        callback(StreamEvent(kind: setError, error: (if errType != "": errType & ": " else: "") & errMsg))
-        return
-      
-      else:
-        discard
-    
-    except JsonParsingError:
-      continue
-  
+    parseAnthropicLine(p, data, callback, toolCallIdx, toolCalls, toolCallBuffers, currentBlockType, thinkingSignature)
+
+  let resp = p.streamClient.performRequest(url, "POST", $body, headers, onLine)
+
+  if resp.statusCode != 200:
+    callback(StreamEvent(kind: setError, error: "API error " & $resp.statusCode & ": " & resp.statusText))
+    return
+
   callback(StreamEvent(kind: setDone, stopReason: "stop"))
 
 method chatStream*(p: AnthropicProvider, params: ChatParams, callback: StreamCallback) =
@@ -313,7 +319,7 @@ method chatStream*(p: AnthropicProvider, params: ChatParams, callback: StreamCal
     except CatchableError as e:
       callback(StreamEvent(kind: setError, error: e.msg))
     return
-  
+
   var lastError = ""
   for attempt in 0 .. p.maxRetries:
     try:
@@ -328,16 +334,16 @@ method chatStream*(p: AnthropicProvider, params: ChatParams, callback: StreamCal
           statusCode = parseInt(parts[2])
       except:
         discard
-      
+
       if not isRetryable(statusCode, lastError):
         callback(StreamEvent(kind: setError, error: lastError))
         return
-      
+
       if attempt < p.maxRetries:
         let delay = retryDelay(attempt, p.baseDelayMs)
         callback(StreamEvent(kind: setRetry, retryAttempt: attempt + 1, retryMax: p.maxRetries, retryError: lastError))
         sleep(delay)
-  
+
   callback(StreamEvent(kind: setError, error: lastError))
 
 method chat*(p: AnthropicProvider, params: ChatParams): seq[StreamEvent] =
