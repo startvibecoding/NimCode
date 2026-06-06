@@ -4,7 +4,6 @@
 const fs = require("fs");
 const path = require("path");
 const https = require("https");
-const { execFileSync } = require("child_process");
 
 const pkg = require("./package.json");
 const binDir = path.join(__dirname, "bin");
@@ -23,6 +22,7 @@ function arch() {
     case "x64": return "amd64";
     case "arm64": return "arm64";
     case "arm": return "arm";
+    case "loong64": return "loongarch64";
     default: return process.arch;
   }
 }

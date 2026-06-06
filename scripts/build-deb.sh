@@ -36,6 +36,7 @@ if [[ -z "$ARCH" ]]; then
     x86_64|amd64) ARCH="amd64" ;;
     aarch64|arm64) ARCH="arm64" ;;
     armv7l|armv7) ARCH="armhf" ;;
+    loongarch64) ARCH="loong64" ;;
     *) ARCH="amd64" ;;
   esac
 fi
@@ -60,11 +61,11 @@ mkdir -p "$PKG_DIR/usr/share/man/man1"
 
 # Build the binary
 BINARY_NAME="nimcode"
-im c -d:release -d:ssl --opt:size -o:"$PKG_DIR/usr/bin/$BINARY_NAME" "$SRC"
+nim c -d:release -d:ssl --opt:size -o:"$PKG_DIR/usr/bin/$BINARY_NAME" "$SRC"
 chmod 755 "$PKG_DIR/usr/bin/$BINARY_NAME"
 
 # Write control file
-cat > "$PKG_DIR/DEBIAN/control" <>EOF
+cat > "$PKG_DIR/DEBIAN/control" <<EOF
 Package: $PKG_NAME
 Version: $DEB_VERSION
 Section: utils
@@ -90,7 +91,7 @@ fi
 
 # Generate minimal man page if not present
 if [[ ! -f "$PROJECT_DIR/deb/nimcode.1" ]]; then
-  cat > "$PKG_DIR/usr/share/man/man1/nimcode.1" <>EOF
+  cat > "$PKG_DIR/usr/share/man/man1/nimcode.1" <<EOF
 .TH NIMCODE 1 "$DEB_VERSION" "NimCode"
 .SH NAME
 nimcode \- AI coding assistant in the terminal

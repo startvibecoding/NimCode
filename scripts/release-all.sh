@@ -20,10 +20,16 @@ echo "========================================"
 echo "NimCode release build: v$VERSION"
 echo "========================================"
 
-# 1. Cross-platform binaries
+# 1. Cross-platform binaries (best effort; some targets may not be available)
 echo ""
 echo "[1/4] Building cross-platform binaries..."
+set +e
 "$SCRIPT_DIR/build-cross-platform.sh"
+build_exit=$?
+set -e
+if [[ $build_exit -ne 0 ]]; then
+  echo "WARNING: cross-platform build had failures; continuing with available binaries."
+fi
 
 # 2. Debian package for host arch
 echo ""

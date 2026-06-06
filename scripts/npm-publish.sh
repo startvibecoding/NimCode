@@ -9,7 +9,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-NPM_DIR="$PROJECT_DIR/npm"
+NPM_TEMPLATES_DIR="$PROJECT_DIR/npm"
+NPM_STAGING_DIR="$PROJECT_DIR/npm-staging"
 DIST_DIR="$PROJECT_DIR/dist"
 NIMBLE_FILE="$PROJECT_DIR/nimcode.nimble"
 
@@ -48,53 +49,65 @@ if ! command -v node &>/dev/null; then
   exit 1
 fi
 
-# Build multi-platform binaries first
+# Build multi-platform binaries first (best effort)
 if [[ -f "$SCRIPT_DIR/build-cross-platform.sh" ]]; then
   echo "Building cross-platform binaries..."
+  set +e
   "$SCRIPT_DIR/build-cross-platform.sh"
+  build_exit=$?
+  set -e
+  if [[ $build_exit -ne 0 ]]; then
+    echo "WARNING: cross-platform build had failures; continuing with available binaries."
+  fi
 else
   echo "ERROR: build-cross-platform.sh not found at $SCRIPT_DIR"
   exit 1
 fi
 
+# Verify we have at least one binary to ship
+if [[ ! -d "$DIST_DIR" ]] || [[ -z "$(ls -A "$DIST_DIR"/nimcode-* 2>/dev/null)" ]]; then
+  echo "ERROR: no binaries available to package."
+  exit 1
+fi
+
 # Prepare npm package directory
-rm -rf "$NPM_DIR"
-mkdir -p "$NPM_DIR/bin"
+rm -rf "$NPM_STAGING_DIR"
+mkdir -p "$NPM_STAGING_DIR/bin"
 
 # Copy binaries
 for binary in "$DIST_DIR"/nimcode-*; do
   if [[ -f "$binary" ]]; then
-    cp "$binary" "$NPM_DIR/bin/"
+    cp "$binary" "$NPM_STAGING_DIR/bin/"
     echo "Included binary: $(basename "$binary")"
   fi
 done
 
-if [[ ! -f "$NPM_DIR/bin/nimcode-linux-amd64" ]]; then
+if [[ ! -f "$NPM_STAGING_DIR/bin/nimcode-linux-amd64" ]]; then
   echo "WARNING: no Linux amd64 binary found. Building fallback native binary..."
-  nim c -d:release -d:ssl --opt:size -o:"$NPM_DIR/bin/nimcode" "$PROJECT_DIR/src/nimcode.nim"
+  nim c -d:release -d:ssl --opt:size -o:"$NPM_STAGING_DIR/bin/nimcode" "$PROJECT_DIR/src/nimcode.nim"
 fi
 
 # Generate package.json from template
-sed "s/{{VERSION}}/$VERSION/g" "$PROJECT_DIR/npm/package.json.template" > "$NPM_DIR/package.json"
+sed "s/{{VERSION}}/$VERSION/g" "$PROJECT_DIR/npm/package.json.template" > "$NPM_STAGING_DIR/package.json"
 
 # Copy install script and docs
-cp "$PROJECT_DIR/npm/install.js" "$NPM_DIR/install.js"
-chmod +x "$NPM_DIR/install.js"
+cp "$PROJECT_DIR/npm/install.js" "$NPM_STAGING_DIR/install.js"
+chmod +x "$NPM_STAGING_DIR/install.js"
 if [[ -f "$PROJECT_DIR/README.md" ]]; then
-  cp "$PROJECT_DIR/README.md" "$NPM_DIR/README.md"
+  cp "$PROJECT_DIR/README.md" "$NPM_STAGING_DIR/README.md"
 fi
 if [[ -f "$PROJECT_DIR/LICENSE" ]]; then
-  cp "$PROJECT_DIR/LICENSE" "$NPM_DIR/LICENSE"
+  cp "$PROJECT_DIR/LICENSE" "$NPM_STAGING_DIR/LICENSE"
 fi
 
 # Verify package.json is valid JSON
 echo ""
 echo "Generated package.json:"
-node -e "const p=require('$NPM_DIR/package.json'); console.log(JSON.stringify(p, null, 2))"
+node -e "const p=require('$NPM_STAGING_DIR/package.json'); console.log(JSON.stringify(p, null, 2))"
 
 # Optional: pack tarball locally
 NPM_TARBALL="$DIST_DIR/nimcode-${VERSION}.tgz"
-cd "$NPM_DIR"
+cd "$NPM_STAGING_DIR"
 npm pack --pack-destination "$DIST_DIR" > /dev/null
 echo ""
 echo "Packed tarball: $NPM_TARBALL"
@@ -116,7 +129,7 @@ elif $PUBLISH; then
   fi
 else
   echo ""
-  echo "Package ready at $NPM_DIR"
+  echo "Package ready at $NPM_STAGING_DIR"
   echo "To publish, run: $0 --publish"
   echo "To dry-run, run: $0 --dry-run"
 fi

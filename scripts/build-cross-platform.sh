@@ -34,6 +34,7 @@ case "$(uname -m)" in
   x86_64|amd64) HOST_ARCH="amd64" ;;
   aarch64|arm64) HOST_ARCH="arm64" ;;
   armv7l|armv7) HOST_ARCH="arm" ;;
+  loongarch64) HOST_ARCH="loongarch64" ;;
   *)            HOST_ARCH="amd64" ;;
 esac
 
@@ -53,10 +54,11 @@ else
   TARGETS=(
     "linux:amd64"
     "linux:arm64"
-    "linux:arm"
+    "linux:loongarch64"
     "macos:amd64"
     "macos:arm64"
     "windows:amd64"
+    "windows:arm64"
   )
 fi
 
@@ -77,6 +79,7 @@ nim_cpu() {
     amd64) echo "amd64" ;;
     arm64) echo "arm64" ;;
     arm) echo "arm" ;;
+    loongarch64) echo "loongarch64" ;;
     *) echo "$1" ;;
   esac
 }
@@ -87,6 +90,16 @@ binary_ext() {
   else
     echo ""
   fi
+}
+
+zig_cpu() {
+  case "$1" in
+    amd64) echo "x86_64" ;;
+    arm64) echo "aarch64" ;;
+    arm) echo "arm" ;;
+    loongarch64) echo "loongarch64" ;;
+    *) echo "$1" ;;
+  esac
 }
 
 # Try to locate a cross-compiler. This is a best-effort helper.
@@ -118,12 +131,22 @@ locate_cross_cc() {
         if command -v "$c" &>/dev/null; then compiler="$c"; break; fi
       done
       ;;
+    linux-loongarch64)
+      for c in loongarch64-linux-gnu-gcc loongarch64-unknown-linux-gnu-gcc; do
+        if command -v "$c" &>/dev/null; then compiler="$c"; break; fi
+      done
+      ;;
     macos-*)
-      # macOS cross-compilation typically requires osxcross or building on macOS
+      # macOS cross-compilation requires Zig or osxcross
       compiler=""
       ;;
     windows-amd64)
       for c in x86_64-w64-mingw32-gcc mingw-w64-gcc; do
+        if command -v "$c" &>/dev/null; then compiler="$c"; break; fi
+      done
+      ;;
+    windows-arm64)
+      for c in aarch64-w64-mingw32-gcc aarch64-unknown-linux-mingw32-gcc; do
         if command -v "$c" &>/dev/null; then compiler="$c"; break; fi
       done
       ;;
@@ -149,12 +172,6 @@ build_target() {
   echo ""
   echo "Building: $target_os / $target_arch -> $out_name"
 
-  # Skip cross-compilation when host cannot satisfy it and it's not the native target
-  if [[ "$target_os" == "macos" && "$HOST_OS" != "macos" ]]; then
-    echo "  SKIP: macOS binaries must be built on macOS (or with osxcross)."
-    return 0
-  fi
-
   local cc_args=()
   if [[ "$target_os" == "$HOST_OS" && "$target_arch" == "$HOST_ARCH" ]]; then
     echo "  Native build"
@@ -166,8 +183,13 @@ build_target() {
     fi
     echo "  Cross-compiler: $cc"
     if [[ "$cc" == "zig cc" ]]; then
-      local zig_target="${cpu_flag}-${os_flag}-musl"
-      [[ "$target_os" == "windows" ]] && zig_target="${cpu_flag}-${os_flag}-gnu"
+      local zcpu="$(zig_cpu "$cpu_flag")"
+      local zig_target="${zcpu}-${os_flag}-musl"
+      if [[ "$target_os" == "windows" ]]; then
+        zig_target="${zcpu}-${os_flag}-gnu"
+      elif [[ "$target_os" == "macos" ]]; then
+        zig_target="${zcpu}-${os_flag}-none"
+      fi
       cc_args+=(
         "--cc:gcc"
         "--gcc.exe:zig"
@@ -184,6 +206,7 @@ build_target() {
     fi
   fi
 
+  set +e
   nim c \
     -d:release \
     -d:ssl \
@@ -193,8 +216,28 @@ build_target() {
     "${cc_args[@]}" \
     -o:"$DIST_DIR/$out_name" \
     "$SRC"
+  local nim_exit=$?
+  set -e
+
+  if [[ $nim_exit -ne 0 ]]; then
+    echo "  FAIL: nim compiler exited with code $nim_exit"
+    rm -f "$DIST_DIR/$out_name"
+    return 1
+  fi
+
+  if [[ ! -f "$DIST_DIR/$out_name" ]]; then
+    echo "  FAIL: expected binary not found at $DIST_DIR/$out_name"
+    return 1
+  fi
+
+  if [[ ! -s "$DIST_DIR/$out_name" ]]; then
+    echo "  FAIL: binary is empty"
+    rm -f "$DIST_DIR/$out_name"
+    return 1
+  fi
 
   echo "  OK: $DIST_DIR/$out_name"
+  return 0
 }
 
 # Main build loop

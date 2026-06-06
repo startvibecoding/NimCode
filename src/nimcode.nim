@@ -1,7 +1,9 @@
 ## NimCode - AI coding assistant
 ## Main entry point
 
-import std/[os, strutils, parseopt, options, json, tables, sequtils, asyncdispatch, times, posix, termios]
+import std/[os, strutils, parseopt, options, json, tables, sequtils, asyncdispatch, times]
+when defined(posix):
+  import std/[posix, termios]
 import nimcode/config/config
 import nimcode/provider/types
 import nimcode/provider/factory
@@ -27,28 +29,33 @@ const VERSION = "0.1.2"
 # Global state
 var gInterruptRequested* = false
 
-proc checkEscKey(): bool =
-  ## Non-blocking check for ESC key press on stdin
-  ## Returns true if standalone ESC was pressed (not part of escape sequence)
-  var pfd: TPollfd
-  pfd.fd = 0
-  pfd.events = POLLIN
-  if poll(addr pfd, 1, 0) > 0 and (pfd.revents and POLLIN) != 0:
-    var buf: array[1, char]
-    if read(0, addr buf[0], 1) == 1:
-      if buf[0] == '\x1b':
-        # Wait briefly to distinguish standalone ESC from escape sequence
-        var pfd2: TPollfd
-        pfd2.fd = 0
-        pfd2.events = POLLIN
-        if poll(addr pfd2, 1, 50) > 0 and (pfd2.revents and POLLIN) != 0:
-          # More chars follow = escape sequence (arrow key, etc.), not ESC
-          discard tcflush(0, TCIFLUSH)
-          return false
-        return true
-      # Not ESC, flush any pending input
-      discard tcflush(0, TCIFLUSH)
-  return false
+when defined(posix):
+  proc checkEscKey(): bool =
+    ## Non-blocking check for ESC key press on stdin
+    ## Returns true if standalone ESC was pressed (not part of escape sequence)
+    var pfd: TPollfd
+    pfd.fd = 0
+    pfd.events = POLLIN
+    if poll(addr pfd, 1, 0) > 0 and (pfd.revents and POLLIN) != 0:
+      var buf: array[1, char]
+      if read(0, addr buf[0], 1) == 1:
+        if buf[0] == '\x1b':
+          # Wait briefly to distinguish standalone ESC from escape sequence
+          var pfd2: TPollfd
+          pfd2.fd = 0
+          pfd2.events = POLLIN
+          if poll(addr pfd2, 1, 50) > 0 and (pfd2.revents and POLLIN) != 0:
+            # More chars follow = escape sequence (arrow key, etc.), not ESC
+            discard tcflush(0, TCIFLUSH)
+            return false
+          return true
+        # Not ESC, flush any pending input
+        discard tcflush(0, TCIFLUSH)
+    return false
+else:
+  proc checkEscKey(): bool =
+    ## ESC-key detection is POSIX-only; on other platforms users can use Ctrl+C.
+    return false
 
 proc printHelp() =
   echo "NimCode - AI coding assistant v" & VERSION

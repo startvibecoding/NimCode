@@ -30,3 +30,7 @@ Thumbs.db
 
 # Nimble
 *.nimble.lock
+
+# Build artifacts
+dist/
+npm-staging/
